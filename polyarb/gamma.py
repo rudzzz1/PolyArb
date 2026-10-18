@@ -7,27 +7,10 @@ from collections import defaultdict
 from typing import Any
 
 from .core import Level
+from .transport import http_get
 
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
-
-DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json",
-}
-
-
-def http_get(url: str, params: dict | None = None, timeout: float = 15) -> Any:
-    """HTTP GET supporting environment proxies (HTTP_PROXY / HTTPS_PROXY) and standard headers."""
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers=DEFAULT_HEADERS)
-    # Check for proxies in environment
-    proxies = urllib.request.getproxies()
-    proxy_handler = urllib.request.ProxyHandler(proxies) if proxies else None
-    opener = urllib.request.build_opener(proxy_handler) if proxy_handler else urllib.request.build_opener()
-    with opener.open(req, timeout=timeout) as r:
-        return json.load(r)
 
 
 def fetch_events(limit: int = 100, max_pages: int = 10) -> list[dict]:
@@ -50,7 +33,7 @@ def parse_market(m: dict, event: dict) -> dict | None:
         outcomes, tokens = _j(m.get("outcomes")), _j(m.get("clobTokenIds"))
         if [o.lower() for o in outcomes] != ["yes", "no"] or len(tokens) != 2:
             return None
-        if m.get("enableOrderBook") is False or not m.get("conditionId"):
+        if m.get("enableOrderBook") is False or not m.get("conditionId") or m.get("closed") is True:
             return None
     except Exception:
         return None

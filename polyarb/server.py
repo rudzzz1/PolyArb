@@ -1,5 +1,8 @@
 """Local HTTP Server hosting the Arbitrage Trading & Simulation Dashboard.
 Zero external dependencies; standard library http.server only.
+Continuously polls Polymarket and Kalshi every 5s to discover candidate trade legs
+with mathematically verified edge, enforces risk controls, tracks per-venue balances,
+records immutable audit logs, tracks contract expiry, and moves trades to Realised only when all legs settle.
 """
 from __future__ import annotations
 import json
@@ -7,16 +10,24 @@ import os
 import sys
 import threading
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse
 
-from .simulator import PortfolioManager, seed_initial_simulator_data, ACTUAL_DATA_TEMPLATES
-from .config import is_kill_switch_active, trigger_kill_switch
+from .simulator import PortfolioManager
+from .poller import LiveMarketPoller
+from .config import Config, is_kill_switch_active, trigger_kill_switch
+from .audit import AuditLog
+from .logger import setup_logging, get_logger
 
 PORT = 8085
+
+# Setup structured logging and audit trail
+logger = setup_logging()
+cfg = Config()
+audit_log = AuditLog(db_path="data/audit.sqlite")
 portfolio = PortfolioManager(initial_capital_inr=10000.0)
-seed_initial_simulator_data(portfolio)
+poller = LiveMarketPoller(portfolio, interval_sec=5.0, cfg=cfg, audit_log=audit_log)
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -37,13 +48,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             summary = portfolio.get_summary()
+            poller_data = {
+                "last_poll_time": poller.last_poll_time,
+                "poll_count": poller.poll_count,
+                "candidates_identified": poller.candidates_identified,
+                "trades_booked": poller.trades_booked,
+                "last_status": poller.last_status,
+                "active_sources": poller.active_sources,
+                "min_edge": poller.cfg.risk.min_edge,
+            }
             data = {
                 "summary": summary,
+                "poller": poller_data,
                 "open_structures": [s.__dict__ | {"legs": [l.__dict__ for l in s.legs]} for s in portfolio.open_structures],
                 "realised_structures": [s.__dict__ | {"legs": [l.__dict__ for l in s.legs]} for s in portfolio.realised_structures],
                 "pending_orders": portfolio.pending_orders,
             }
             self.wfile.write(json.dumps(data).encode("utf-8"))
+        elif parsed.path == "/api/audit":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            events = audit_log.get_events(limit=50)
+            self.wfile.write(json.dumps(events).encode("utf-8"))
         else:
             self.send_response(404)
             self.end_headers()
@@ -53,14 +81,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
 
-        if parsed.path == "/api/settle_trade":
+        if parsed.path == "/api/poll_now":
+            # Force immediate live poll tick
+            res = poller.poll_once()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "status": "success",
+                "message": f"Polled Polymarket ({res.get('poly_count',0)}) & Kalshi ({res.get('kalshi_count',0)}). Found {res.get('candidates_found',0)} candidate pairs.",
+                "poll_result": res,
+            }).encode("utf-8"))
+
+        elif parsed.path == "/api/settle_trade":
             # Settle the first open trade or specified structure
             struct_id = body.get("structure_id")
             if not struct_id and portfolio.open_structures:
                 struct_id = portfolio.open_structures[0].structure_id
             if struct_id:
-                portfolio.settle_entire_structure(struct_id, world_outcome="YES")
+                portfolio.settle_entire_structure(struct_id)
                 res = {"status": "success", "message": f"Settled all legs of {struct_id}. Trade moved to Realised!"}
+                audit_log.log(action="STRUCTURE_SETTLED", venue="portfolio", order_id=struct_id, status="REALISED")
             else:
                 res = {"status": "error", "message": "No open structures to settle"}
 
@@ -71,7 +113,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(res).encode("utf-8"))
 
         elif parsed.path == "/api/settle_single_leg":
-            # Settle only ONE leg of an open structure (to demonstrate that trade STAYS open until all legs settle)
             struct_id = body.get("structure_id")
             leg_id = body.get("leg_id")
             if not struct_id and portfolio.open_structures:
@@ -82,7 +123,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
             if struct_id and leg_id:
                 portfolio.settle_single_leg(struct_id, leg_id, outcome="YES")
-                res = {"status": "success", "message": f"Settled single leg {leg_id}. Structure remains in Open Positions until all legs settle."}
+                res = {"status": "success", "message": f"Settled leg {leg_id}. Notice: Structure remains in Open Positions until ALL legs settle!"}
+                audit_log.log(action="LEG_SETTLED", venue="portfolio", order_id=f"{struct_id}/{leg_id}", status="SETTLED")
             else:
                 res = {"status": "error", "message": "No unsettled legs available"}
 
@@ -93,20 +135,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(res).encode("utf-8"))
 
         elif parsed.path == "/api/book_next":
-            # Book another structure from templates
-            open_count = len(portfolio.open_structures)
-            tpl = ACTUAL_DATA_TEMPLATES[open_count % len(ACTUAL_DATA_TEMPLATES)]
-            booked = portfolio.book_structure(tpl["kind"], tpl["event_title"], tpl["relation_id"], tpl["legs"], tpl["note"])
-            if booked:
-                res = {"status": "success", "message": f"Booked structure {booked.structure_id} ({booked.kind})"}
+            # Phase 0.5: No template fallback. Only book mathematically verified live mispricings!
+            res = poller.poll_once()
+            if res.get("booked_this_tick", 0) > 0:
+                msg = f"Live 5s Poller identified and booked {res['booked_this_tick']} verified positive-edge trade(s)!"
             else:
-                res = {"status": "error", "message": "Insufficient capital or kill switch active"}
+                msg = f"Live scan completed ({res.get('poly_count',0)} Poly / {res.get('kalshi_count',0)} Kalshi). No mispricings meeting edge gate (min {poller.cfg.risk.min_edge*100:.1f}%) right now."
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            self.wfile.write(json.dumps(res).encode("utf-8"))
+            self.wfile.write(json.dumps({"status": "success", "message": msg}).encode("utf-8"))
 
         elif parsed.path == "/api/toggle_kill":
             if is_kill_switch_active("data"):
@@ -116,9 +156,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if "POLYARB_KILL_SWITCH" in os.environ:
                     del os.environ["POLYARB_KILL_SWITCH"]
                 res = {"status": "success", "kill_switch": False, "message": "Kill switch deactivated. Operations resumed."}
+                audit_log.log(action="KILL_SWITCH_DEACTIVATED", venue="system", status="RESUMED")
             else:
                 trigger_kill_switch("Manual UI toggle", data_dir="data")
                 res = {"status": "success", "kill_switch": True, "message": "Kill switch activated. Operations halted."}
+                audit_log.log(action="KILL_SWITCH_ACTIVATED", venue="system", status="HALTED")
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -128,8 +170,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/api/reset":
             portfolio.reset()
-            seed_initial_simulator_data(portfolio)
-            res = {"status": "success", "message": "Portfolio reset to initial ₹10,000 INR."}
+            poller.booked_relations.clear()
+            poller.poll_once()
+            res = {"status": "success", "message": "Portfolio reset to initial ₹10,000 INR. Polled live markets."}
+            audit_log.log(action="PORTFOLIO_RESET", venue="system", status="RESET")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -139,22 +183,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
-
-
-def run_background_market_fluctuations():
-    """Simulates realistic micro-market fluctuations on open legs."""
-    while True:
-        try:
-            time.sleep(3.0)
-            if portfolio.open_structures:
-                for s in portfolio.open_structures:
-                    for l in s.legs:
-                        if l.settlement_status == "OPEN":
-                            # subtle realistic tick +/- 0.005
-                            drift = round(random.uniform(-0.005, 0.005), 3)
-                            l.current_price_usd = max(0.01, min(0.99, round(l.current_price_usd + drift, 3)))
-        except Exception:
-            pass
 
 
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -200,11 +228,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       margin-bottom: 24px;
       padding-bottom: 20px;
       border-bottom: 1px solid var(--card-border);
+      flex-wrap: wrap;
+      gap: 16px;
     }
     .brand {
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 14px;
+      flex-wrap: wrap;
     }
     .brand h1 {
       font-size: 22px;
@@ -218,16 +249,42 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       font-size: 11px;
       background: rgba(56, 189, 248, 0.15);
       color: var(--accent);
-      padding: 2px 8px;
+      padding: 3px 8px;
       border-radius: 4px;
       font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.5px;
     }
+    .badge-poller {
+      font-size: 11px;
+      background: rgba(16, 185, 129, 0.15);
+      color: var(--green);
+      padding: 3px 10px;
+      border-radius: 20px;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid rgba(16, 185, 129, 0.25);
+    }
+    .pulse-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 8px var(--green);
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(0.85); }
+      100% { opacity: 1; transform: scale(1); }
+    }
     .header-controls {
       display: flex;
       gap: 10px;
       align-items: center;
+      flex-wrap: wrap;
     }
     .btn {
       background: #1e293b;
@@ -248,6 +305,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     .btn-green:hover { background: #047857; }
     .btn-red { background: #881337; color: #fecdd3; border-color: #be123c; }
     .btn-red:hover { background: #be123c; }
+    .btn-accent { background: rgba(56, 189, 248, 0.15); color: var(--accent); border-color: rgba(56, 189, 248, 0.3); }
+    .btn-accent:hover { background: rgba(56, 189, 248, 0.25); }
 
     /* Metrics Grid */
     .metrics {
@@ -383,6 +442,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     .badge-kalshi { background: rgba(236, 72, 153, 0.15); color: #f472b6; }
     .badge-yes { background: var(--green-bg); color: var(--green); }
     .badge-no { background: var(--purple-bg); color: #c084fc; }
+    .badge-expiry { background: rgba(56, 189, 248, 0.1); color: #7dd3fc; border: 1px solid rgba(56, 189, 248, 0.2); }
 
     /* Nested Accordion Sub-table */
     tr.legs-row {
@@ -408,6 +468,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       margin-bottom: 10px;
       display: flex;
       justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px;
     }
     .nested-table {
       font-size: 12px;
@@ -448,17 +510,24 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <!-- Header -->
   <div class="header">
     <div class="brand">
-      <h1>PolyArb Terminal <span class="badge-sim">Paper Simulator</span></h1>
+      <h1>PolyArb Terminal <span class="badge-sim">Paper Simulator (₹10k INR)</span></h1>
+      <span class="badge-poller" id="pollerBadge">
+        <span class="pulse-dot"></span>
+        <span id="pollerStatusText">5s Poller Active (Polymarket + Kalshi)</span>
+      </span>
     </div>
     <div class="header-controls">
-      <button class="btn btn-green" onclick="settleOneLeg()">
+      <button class="btn btn-accent" onclick="pollNow()" title="Trigger immediate live scan across Polymarket & Kalshi">
+        ⚡ Poll Now (5s)
+      </button>
+      <button class="btn btn-green" onclick="settleOneLeg()" title="Test rule: settle 1 leg to verify trade remains in Open tab">
         ⚡ Settle 1 Leg (Test Rule)
       </button>
-      <button class="btn btn-green" onclick="settleAllLegs()">
+      <button class="btn btn-green" onclick="settleAllLegs()" title="Settle all legs to realize trade">
         ✔ Settle All Legs (Move to Realised)
       </button>
       <button class="btn" onclick="bookNext()">
-        ➕ Book Next Structure
+        ➕ Scan & Book Live Mispricing
       </button>
       <button class="btn" id="killBtn" onclick="toggleKillSwitch()">
         🛑 Kill Switch
@@ -480,11 +549,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="metric-label">Available Cash</div>
       <div class="metric-value mono" style="color: var(--accent);" id="availCash">₹0.00</div>
       <div class="metric-sub" id="availCashUsd">$0.00 USD</div>
+      <div class="metric-sub" id="venueSplit" style="font-size: 10px; color: var(--accent);">Poly: $0.00 | Kalshi: $0.00</div>
     </div>
     <div class="metric-card">
       <div class="metric-label">Locked in Structures</div>
       <div class="metric-value mono" style="color: var(--yellow);" id="lockedCap">₹0.00</div>
       <div class="metric-sub" id="lockedCapUsd">$0.00 USD</div>
+      <div class="metric-sub" id="lockedSplit" style="font-size: 10px; color: var(--yellow);">Poly: $0.00 | Kalshi: $0.00</div>
     </div>
     <div class="metric-card">
       <div class="metric-label">Realised P&L</div>
@@ -506,12 +577,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <!-- Tabs Navigation -->
   <div class="tab-bar">
     <button class="tab-btn active" id="tabOpenBtn" onclick="switchTab('open')">
-      Open Positions & Structures
+      Open Positions & Orders
       <span class="pill" id="openCountPill">0</span>
     </button>
     <button class="tab-btn" id="tabRealisedBtn" onclick="switchTab('realised')">
       Realised Positions (All Legs Settled)
       <span class="pill" id="realisedCountPill">0</span>
+    </button>
+    <button class="tab-btn" id="tabAuditBtn" onclick="switchTab('audit')">
+      Audit Trail (Immutable)
+      <span class="pill" id="auditCountPill">0</span>
     </button>
   </div>
 
@@ -524,6 +599,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <th>ID</th>
           <th>Strategy</th>
           <th>Event & Market Structure</th>
+          <th>Expiry</th>
           <th>Legs</th>
           <th>Shares</th>
           <th>Invested (₹)</th>
@@ -534,7 +610,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </tr>
       </thead>
       <tbody id="openTableBody">
-        <tr><td colspan="11" class="empty-state">Loading open positions...</td></tr>
+        <tr><td colspan="12" class="empty-state">Loading open positions...</td></tr>
       </tbody>
     </table>
   </div>
@@ -548,6 +624,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <th>ID</th>
           <th>Strategy</th>
           <th>Event & Market Structure</th>
+          <th>Expiry</th>
           <th>Legs</th>
           <th>Shares</th>
           <th>Invested (₹)</th>
@@ -559,7 +636,30 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </tr>
       </thead>
       <tbody id="realisedTableBody">
-        <tr><td colspan="12" class="empty-state">No realised positions yet.</td></tr>
+        <tr><td colspan="13" class="empty-state">No realised positions yet. Trades move here only once ALL constituent legs are settled.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Audit Trail Tab -->
+  <div id="tabAudit" class="table-container" style="display: none;">
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Timestamp (UTC)</th>
+          <th>Action</th>
+          <th>Venue</th>
+          <th>Order / Structure</th>
+          <th>Side</th>
+          <th>Price ($)</th>
+          <th>Size</th>
+          <th>Status</th>
+          <th>Response SHA256</th>
+        </tr>
+      </thead>
+      <tbody id="auditTableBody">
+        <tr><td colspan="10" class="empty-state">Loading audit events...</td></tr>
       </tbody>
     </table>
   </div>
@@ -569,20 +669,24 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <script>
     let activeTab = 'open';
     const expandedIds = new Set();
+    let lastData = null;
 
     function showToast(msg) {
       const t = document.getElementById('toast');
       t.innerText = msg;
       t.style.display = 'block';
-      setTimeout(() => { t.style.display = 'none'; }, 3500);
+      setTimeout(() => { t.style.display = 'none'; }, 4000);
     }
 
     function switchTab(tab) {
       activeTab = tab;
       document.getElementById('tabOpenBtn').classList.toggle('active', tab === 'open');
       document.getElementById('tabRealisedBtn').classList.toggle('active', tab === 'realised');
+      document.getElementById('tabAuditBtn').classList.toggle('active', tab === 'audit');
       document.getElementById('tabOpen').style.display = tab === 'open' ? 'block' : 'none';
       document.getElementById('tabRealised').style.display = tab === 'realised' ? 'block' : 'none';
+      document.getElementById('tabAudit').style.display = tab === 'audit' ? 'block' : 'none';
+      if (tab === 'audit') fetchAuditLog();
     }
 
     function toggleExpand(id) {
@@ -593,8 +697,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       }
       renderData(lastData);
     }
-
-    let lastData = null;
 
     async function fetchPortfolio() {
       try {
@@ -607,16 +709,53 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       }
     }
 
+    async function fetchAuditLog() {
+      try {
+        const res = await fetch('/api/audit');
+        const events = await res.json();
+        renderAuditEvents(events);
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    function renderAuditEvents(events) {
+      const tbody = document.getElementById('auditTableBody');
+      document.getElementById('auditCountPill').innerText = events.length;
+      if (!events || events.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="10" class="empty-state">No audit records logged yet.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = events.map(e => `
+        <tr>
+          <td class="mono" style="color: var(--text-dim);">${e.id}</td>
+          <td class="mono" style="font-size: 11px;">${e.ts ? e.ts.substring(11, 19) : ''}</td>
+          <td><span class="badge ${e.action.includes('PLACED') ? 'badge-open' : (e.action.includes('SETTLED') ? 'badge-realised' : 'badge-partial')}">${e.action}</span></td>
+          <td><span class="badge ${e.venue === 'kalshi' ? 'badge-kalshi' : 'badge-polymarket'}">${e.venue}</span></td>
+          <td class="mono">${e.order_id || e.market_id || ''}</td>
+          <td>${e.side ? `<span class="badge ${e.side === 'YES' ? 'badge-yes' : 'badge-no'}">${e.side}</span>` : '-'}</td>
+          <td class="mono">${e.price > 0 ? '$' + e.price.toFixed(3) : '-'}</td>
+          <td class="mono">${e.size > 0 ? e.size : '-'}</td>
+          <td><span class="badge badge-open">${e.status}</span></td>
+          <td class="mono" style="font-size: 10px; color: var(--text-muted);">${e.raw_response_hash ? e.raw_response_hash.substring(0, 12) + '...' : '-'}</td>
+        </tr>
+      `).join('');
+    }
+
     function renderData(data) {
       if (!data) return;
       const s = data.summary;
+      const poller = data.poller || {};
 
       document.getElementById('initCap').innerText = '₹' + s.initial_capital_inr.toLocaleString('en-IN', {minimumFractionDigits: 2});
       document.getElementById('initCapUsd').innerText = '≈ $' + s.initial_capital_usd.toFixed(2) + ' USD';
       document.getElementById('availCash').innerText = '₹' + s.available_cash_inr.toLocaleString('en-IN', {minimumFractionDigits: 2});
       document.getElementById('availCashUsd').innerText = '$' + s.available_cash_usd.toFixed(2) + ' USD';
+      document.getElementById('venueSplit').innerText = `Poly: $${(s.balance_polymarket_usd||0).toFixed(2)} | Kalshi: $${(s.balance_kalshi_usd||0).toFixed(2)}`;
+
       document.getElementById('lockedCap').innerText = '₹' + s.locked_capital_inr.toLocaleString('en-IN', {minimumFractionDigits: 2});
       document.getElementById('lockedCapUsd').innerText = '$' + s.locked_capital_usd.toFixed(2) + ' USD';
+      document.getElementById('lockedSplit').innerText = `Poly: $${(s.locked_polymarket_usd||0).toFixed(2)} | Kalshi: $${(s.locked_kalshi_usd||0).toFixed(2)}`;
 
       const rColor = s.realised_pnl_inr >= 0 ? 'var(--green)' : 'var(--red)';
       const rPrefix = s.realised_pnl_inr >= 0 ? '+₹' : '-₹';
@@ -630,6 +769,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       document.getElementById('openCountPill').innerText = data.open_structures.length;
       document.getElementById('realisedCountPill').innerText = data.realised_structures.length;
 
+      // Update Poller Status Text
+      if (poller.last_poll_time) {
+        document.getElementById('pollerStatusText').innerText = `5s Poller Active (${poller.last_poll_time}) | Edge Gate ≥ ${(poller.min_edge*100).toFixed(1)}% | Booked: ${poller.trades_booked}`;
+      }
+
       const killBtn = document.getElementById('killBtn');
       if (s.kill_switch_active) {
         killBtn.innerText = '⚠ RESUME (KILLED)';
@@ -642,7 +786,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       // Render Open Structures
       const openBody = document.getElementById('openTableBody');
       if (data.open_structures.length === 0) {
-        openBody.innerHTML = '<tr><td colspan="11" class="empty-state">No active open positions. Click "Book Next Structure" to deploy capital.</td></tr>';
+        openBody.innerHTML = '<tr><td colspan="12" class="empty-state">No active open positions. Live 5s poller is scanning Polymarket & Kalshi for verified positive-edge mispricings...</td></tr>';
       } else {
         openBody.innerHTML = data.open_structures.map(st => renderStructureRow(st, false)).join('');
       }
@@ -650,7 +794,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       // Render Realised Structures
       const realisedBody = document.getElementById('realisedTableBody');
       if (data.realised_structures.length === 0) {
-        realisedBody.innerHTML = '<tr><td colspan="12" class="empty-state">No realised positions yet. Settle trades to see them here once all legs finish.</td></tr>';
+        realisedBody.innerHTML = '<tr><td colspan="13" class="empty-state">No realised positions yet. Trades move here only once ALL constituent legs are settled.</td></tr>';
       } else {
         realisedBody.innerHTML = data.realised_structures.map(st => renderStructureRow(st, true)).join('');
       }
@@ -681,6 +825,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <div style="font-weight: 600;">${st.event_title}</div>
             <div style="font-size: 11px; color: var(--text-muted);">${st.note || ''}</div>
           </td>
+          <td>
+            <span class="badge badge-expiry mono">${st.expiry_display || 'N/A'}</span>
+          </td>
           <td class="mono">${st.legs.length} legs</td>
           <td class="mono">${st.legs[0] ? st.legs[0].shares : 0}</td>
           <td class="mono">₹${st.total_cost_inr.toFixed(2)}</td>
@@ -695,10 +842,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       if (isExp) {
         rowHtml += `
           <tr class="legs-row">
-            <td colspan="${isRealised ? 12 : 11}">
+            <td colspan="${isRealised ? 13 : 12}">
               <div class="nested-box">
                 <div class="nested-header">
-                  <span>Structure Legs Breakdown (${st.legs.length} Contracts)</span>
+                  <span>Structure Legs Breakdown (${st.legs.length} Contracts) — Expiry & Cutoff Times</span>
                   <span>Strict Settlement Gate: All legs must settle to realize trade</span>
                 </div>
                 <table class="nested-table">
@@ -712,6 +859,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                       <th>Entry Price</th>
                       <th>Cost (₹)</th>
                       <th>Current Price</th>
+                      <th>Contract Expiry</th>
                       <th>Settled Payoff</th>
                       <th>Status</th>
                     </tr>
@@ -721,12 +869,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                       <tr>
                         <td class="mono" style="color: var(--text-dim);">${l.leg_id}</td>
                         <td><span class="badge ${l.venue === 'kalshi' ? 'badge-kalshi' : 'badge-polymarket'}">${l.venue}</span></td>
-                        <td style="max-width: 320px;">${l.question}</td>
+                        <td style="max-width: 300px;">${l.question}</td>
                         <td><span class="badge ${l.side === 'YES' ? 'badge-yes' : 'badge-no'}">${l.side}</span></td>
                         <td class="mono">${l.shares}</td>
                         <td class="mono">$${l.entry_price_usd.toFixed(3)}</td>
                         <td class="mono">₹${l.cost_inr.toFixed(2)}</td>
                         <td class="mono">$${l.current_price_usd.toFixed(3)}</td>
+                        <td><span class="badge badge-expiry mono">${l.expiry_display || 'N/A'}</span></td>
                         <td class="mono">${l.settlement_status === 'SETTLED' ? `₹${l.payoff_inr.toFixed(2)} ($${l.payoff_usd.toFixed(2)})` : 'Pending'}</td>
                         <td>
                           <span class="badge ${l.settlement_status === 'SETTLED' ? 'badge-realised' : 'badge-open'}">
@@ -746,11 +895,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       return rowHtml;
     }
 
+    async function pollNow() {
+      showToast('Polling Polymarket & Kalshi live...');
+      const res = await fetch('/api/poll_now', { method: 'POST' });
+      const data = await res.json();
+      showToast(data.message);
+      fetchPortfolio();
+      if (activeTab === 'audit') fetchAuditLog();
+    }
+
     async function settleOneLeg() {
       const res = await fetch('/api/settle_single_leg', { method: 'POST' });
       const data = await res.json();
       showToast(data.message);
       fetchPortfolio();
+      if (activeTab === 'audit') fetchAuditLog();
     }
 
     async function settleAllLegs() {
@@ -758,6 +917,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const data = await res.json();
       showToast(data.message);
       fetchPortfolio();
+      if (activeTab === 'audit') fetchAuditLog();
     }
 
     async function bookNext() {
@@ -765,6 +925,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const data = await res.json();
       showToast(data.message);
       fetchPortfolio();
+      if (activeTab === 'audit') fetchAuditLog();
     }
 
     async function toggleKillSwitch() {
@@ -772,6 +933,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const data = await res.json();
       showToast(data.message);
       fetchPortfolio();
+      if (activeTab === 'audit') fetchAuditLog();
     }
 
     async function resetPortfolio() {
@@ -780,6 +942,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         const data = await res.json();
         showToast(data.message);
         fetchPortfolio();
+        if (activeTab === 'audit') fetchAuditLog();
       }
     }
 
@@ -797,17 +960,19 @@ def start_server(port: int = PORT):
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
-    # Start market fluctuation thread
-    t = threading.Thread(target=run_background_market_fluctuations, daemon=True)
-    t.start()
 
-    server = HTTPServer(("127.0.0.1", port), DashboardHandler)
-    print("\n" + "=" * 56)
-    print(f"[ONLINE] PolyArb Trading Terminal running at http://localhost:{port}")
-    print(f"         Initial Capital: INR 10,000 (~$119.76 USD)")
-    print(f"         Open & Realised Tabs with Accordion Breakdown")
-    print(f"         Strict Rule: Trade moves to Realised ONLY when all legs settle")
-    print("=" * 56 + "\n")
+    # Start live 5-second market poller across Polymarket & Kalshi
+    poller.start()
+
+    server = ThreadingHTTPServer(("0.0.0.0", port), DashboardHandler)
+    server.daemon_threads = True
+    logger.info("=" * 60)
+    logger.info(f"PolyArb Terminal running at http://localhost:{port} (bound to 0.0.0.0:{port})")
+    logger.info("Capital: INR 10,000.00 (~$119.76 USD)")
+    logger.info("Sources: Live 5s Poller on Polymarket & Kalshi APIs")
+    logger.info("Risk Controls: Best Basket Mathematical Edge Gate, Venue Exposure Limits")
+    logger.info("Audit: Immutable Append-Only SQLite Trail (audit.sqlite)")
+    logger.info("=" * 60)
     server.serve_forever()
 
 

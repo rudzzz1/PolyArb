@@ -11,6 +11,11 @@ test_files = [
     "tests/test_limits_and_controls.py",
     "tests/test_fixtures.py",
     "tests/test_simulator.py",
+    "tests/test_credentials.py",
+    "tests/test_audit.py",
+    "tests/test_executors.py",
+    "tests/test_per_venue_balance.py",
+    "tests/test_poller_edge_gate.py",
 ]
 
 if __name__ == "__main__":

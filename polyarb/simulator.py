@@ -23,6 +23,27 @@ from .config import Config, is_kill_switch_active
 INR_PER_USD = 83.50  # 1 USD = 83.50 INR
 
 
+def format_expiry(iso_str: str | None) -> str:
+    if not iso_str:
+        return "N/A"
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        delta_sec = (dt - now).total_seconds()
+        delta_days = delta_sec / 86400.0
+        date_formatted = dt.strftime("%b %d, %Y")
+        if delta_sec > 0:
+            if delta_days >= 2:
+                return f"{date_formatted} ({int(delta_days)}d)"
+            else:
+                hours = max(1, int(delta_sec / 3600))
+                return f"{date_formatted} ({hours}h)"
+        else:
+            return f"{date_formatted} (Expired)"
+    except Exception:
+        return str(iso_str)[:10]
+
+
 @dataclass
 class LegPosition:
     leg_id: str
@@ -39,6 +60,8 @@ class LegPosition:
     settlement_outcome: str | None # 'YES' | 'NO' | 'VOID' | None
     payoff_usd: float = 0.0
     payoff_inr: float = 0.0
+    expiry: str = ""
+    expiry_display: str = ""
 
 
 @dataclass
@@ -61,6 +84,8 @@ class StructurePosition:
     booked_at: str = ""
     settled_at: str | None = None
     note: str = ""
+    expiry: str = ""
+    expiry_display: str = ""
 
     def check_and_update_settlement(self) -> bool:
         """Rule: A trade should ONLY move from open to realised once ALL legs are settled."""
@@ -89,6 +114,9 @@ class PortfolioManager:
 
         self.available_cash_inr = self.initial_capital_inr
         self.available_cash_usd = self.initial_capital_usd
+        # Per-venue balance tracking (Phase 1.5)
+        self.balance_polymarket_usd = round(self.initial_capital_usd / 2.0, 2)
+        self.balance_kalshi_usd = round(self.initial_capital_usd / 2.0, 2)
         self.realised_pnl_inr = 0.0
         self.realised_pnl_usd = 0.0
 
@@ -104,6 +132,12 @@ class PortfolioManager:
     def get_locked_capital_usd(self) -> float:
         return sum(s.total_cost_usd for s in self.open_structures)
 
+    def get_locked_capital_per_venue(self) -> tuple[float, float]:
+        """Returns (polymarket_locked_usd, kalshi_locked_usd)."""
+        poly_locked = sum(l.cost_usd for s in self.open_structures for l in s.legs if l.venue == "polymarket")
+        kalshi_locked = sum(l.cost_usd for s in self.open_structures for l in s.legs if l.venue == "kalshi")
+        return round(poly_locked, 2), round(kalshi_locked, 2)
+
     def get_unrealised_pnl_inr(self) -> float:
         # Expected guaranteed edge of open positions
         return sum(s.projected_profit_inr for s in self.open_structures)
@@ -111,11 +145,16 @@ class PortfolioManager:
     def get_summary(self) -> dict[str, Any]:
         locked_inr = self.get_locked_capital_inr()
         locked_usd = self.get_locked_capital_usd()
+        poly_locked, kalshi_locked = self.get_locked_capital_per_venue()
         return {
             "initial_capital_inr": self.initial_capital_inr,
             "initial_capital_usd": self.initial_capital_usd,
             "available_cash_inr": round(self.available_cash_inr, 2),
             "available_cash_usd": round(self.available_cash_usd, 2),
+            "balance_polymarket_usd": round(self.balance_polymarket_usd, 2),
+            "balance_kalshi_usd": round(self.balance_kalshi_usd, 2),
+            "locked_polymarket_usd": poly_locked,
+            "locked_kalshi_usd": kalshi_locked,
             "locked_capital_inr": round(locked_inr, 2),
             "locked_capital_usd": round(locked_usd, 2),
             "realised_pnl_inr": round(self.realised_pnl_inr, 2),
@@ -130,21 +169,40 @@ class PortfolioManager:
         }
 
     def book_structure(self, kind: str, event_title: str, relation_id: str,
-                       legs_info: list[dict], note: str = "") -> StructurePosition | None:
+                       legs_info: list[dict], note: str = "",
+                       unit_payoff: float = 1.0) -> StructurePosition | None:
         """Book a multi-leg structure into open positions if sufficient capital is available."""
         if is_kill_switch_active(self.data_dir):
             return None
 
-        # Calculate costs
+        # Calculate costs per leg and per venue
         total_cost_usd = sum(l["shares"] * l["entry_price_usd"] for l in legs_info)
         total_cost_inr = round(total_cost_usd * INR_PER_USD, 2)
 
         if total_cost_inr > self.available_cash_inr:
             return None  # Exceeds available capital
 
-        # Guaranteed minimum payoff based on structure logic (usually 1.00 USD per share set)
+        poly_cost_usd = sum(l["shares"] * l["entry_price_usd"] for l in legs_info if l.get("venue") == "polymarket")
+        kalshi_cost_usd = sum(l["shares"] * l["entry_price_usd"] for l in legs_info if l.get("venue") == "kalshi")
+
+        # Dynamic cash rebalancing between venue balances if total cash is sufficient
+        if poly_cost_usd > self.balance_polymarket_usd:
+            needed = poly_cost_usd - self.balance_polymarket_usd
+            if self.balance_kalshi_usd >= needed:
+                self.balance_kalshi_usd -= needed
+                self.balance_polymarket_usd += needed
+        elif kalshi_cost_usd > self.balance_kalshi_usd:
+            needed = kalshi_cost_usd - self.balance_kalshi_usd
+            if self.balance_polymarket_usd >= needed:
+                self.balance_polymarket_usd -= needed
+                self.balance_kalshi_usd += needed
+
+        if poly_cost_usd > self.balance_polymarket_usd + 0.01 or kalshi_cost_usd > self.balance_kalshi_usd + 0.01:
+            return None
+
+        # Guaranteed minimum payoff based on exact basket payoff (Phase 0.3)
         shares = legs_info[0]["shares"] if legs_info else 0.0
-        payoff_usd = 1.0 * shares
+        payoff_usd = round(unit_payoff * shares, 4)
         payoff_inr = round(payoff_usd * INR_PER_USD, 2)
 
         profit_usd = round(payoff_usd - total_cost_usd, 4)
@@ -155,9 +213,15 @@ class PortfolioManager:
         now_iso = datetime.now(timezone.utc).isoformat()
 
         leg_objs = []
+        struct_expiry = None
         for idx, l in enumerate(legs_info):
             c_usd = round(l["shares"] * l["entry_price_usd"], 4)
             c_inr = round(c_usd * INR_PER_USD, 2)
+            exp = l.get("expiry") or ""
+            exp_disp = format_expiry(exp)
+            if exp and (not struct_expiry or exp > struct_expiry):
+                struct_expiry = exp
+
             leg_objs.append(LegPosition(
                 leg_id=f"{struct_id}-L{idx+1}",
                 market_id=l["market_id"],
@@ -171,6 +235,8 @@ class PortfolioManager:
                 current_price_usd=l["entry_price_usd"],
                 settlement_status="OPEN",
                 settlement_outcome=None,
+                expiry=exp,
+                expiry_display=exp_disp,
             ))
 
         struct = StructurePosition(
@@ -189,11 +255,15 @@ class PortfolioManager:
             return_pct=ret_pct,
             booked_at=now_iso,
             note=note,
+            expiry=struct_expiry or "",
+            expiry_display=format_expiry(struct_expiry),
         )
 
-        # Deduct capital from cash
+        # Deduct capital from cash and per-venue balances (Phase 1.5)
         self.available_cash_inr -= total_cost_inr
         self.available_cash_usd -= total_cost_usd
+        self.balance_polymarket_usd = max(0.0, round(self.balance_polymarket_usd - poly_cost_usd, 4))
+        self.balance_kalshi_usd = max(0.0, round(self.balance_kalshi_usd - kalshi_cost_usd, 4))
         self.open_structures.append(struct)
         self.save()
         return struct
@@ -218,6 +288,12 @@ class PortfolioManager:
             leg.payoff_usd = 0.0
         leg.payoff_inr = round(leg.payoff_usd * INR_PER_USD, 2)
 
+        # Credit venue balance
+        if leg.venue == "polymarket":
+            self.balance_polymarket_usd += leg.payoff_usd
+        elif leg.venue == "kalshi":
+            self.balance_kalshi_usd += leg.payoff_usd
+
         # Check if entire structure is settled
         if struct.check_and_update_settlement():
             self.open_structures.remove(struct)
@@ -233,22 +309,34 @@ class PortfolioManager:
         self.save()
         return True
 
-    def settle_entire_structure(self, struct_id: str, world_outcome: str = "YES"):
-        """Settles all remaining legs according to the logically feasible outcome."""
+    def settle_entire_structure(self, struct_id: str, world_outcome: str | None = None):
+        """Settles all remaining legs according to the logically feasible worst-case outcome."""
         struct = next((s for s in self.open_structures if s.structure_id == struct_id), None)
         if not struct:
             return False
 
-        for leg in struct.legs:
+        target_payoff_usd = struct.guaranteed_payoff_usd
+        for idx, leg in enumerate(struct.legs):
             if leg.settlement_status != "SETTLED":
-                # For an implies relation A => B (legs: NO on A, YES on B):
-                # If world_outcome is 'YES': B is YES (pays 1.0), A can be YES or NO.
-                leg_win = (leg.side == "YES" and world_outcome == "YES") or (leg.side == "NO" and world_outcome == "NO")
-                outcome = leg.side if leg_win else ("NO" if leg.side == "YES" else "YES")
                 leg.settlement_status = "SETTLED"
-                leg.settlement_outcome = outcome
-                leg.payoff_usd = round(1.0 * leg.shares, 4) if leg_win else 0.0
+                if world_outcome:
+                    leg_win = (leg.side == "YES" and world_outcome == "YES") or (leg.side == "NO" and world_outcome == "NO")
+                    outcome = leg.side if leg_win else ("NO" if leg.side == "YES" else "YES")
+                    leg.settlement_outcome = outcome
+                    leg.payoff_usd = round(1.0 * leg.shares, 4) if leg_win else 0.0
+                else:
+                    # Allocate guaranteed payoff realistically (Phase 0.6)
+                    if idx == 0:
+                        leg.settlement_outcome = leg.side
+                        leg.payoff_usd = target_payoff_usd
+                    else:
+                        leg.settlement_outcome = "NO" if leg.side == "YES" else "YES"
+                        leg.payoff_usd = 0.0
                 leg.payoff_inr = round(leg.payoff_usd * INR_PER_USD, 2)
+                if leg.venue == "polymarket":
+                    self.balance_polymarket_usd += leg.payoff_usd
+                elif leg.venue == "kalshi":
+                    self.balance_kalshi_usd += leg.payoff_usd
 
         if struct.check_and_update_settlement():
             self.open_structures.remove(struct)
@@ -268,13 +356,18 @@ class PortfolioManager:
             "initial_capital_inr": self.initial_capital_inr,
             "available_cash_inr": self.available_cash_inr,
             "available_cash_usd": self.available_cash_usd,
+            "balance_polymarket_usd": self.balance_polymarket_usd,
+            "balance_kalshi_usd": self.balance_kalshi_usd,
             "realised_pnl_inr": self.realised_pnl_inr,
             "realised_pnl_usd": self.realised_pnl_usd,
             "open_structures": [asdict(s) for s in self.open_structures],
             "realised_structures": [asdict(s) for s in self.realised_structures],
             "pending_orders": self.pending_orders,
         }
-        self.storage_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        # Atomic file write (write-then-rename) prevents corruption
+        tmp_file = self.storage_file.with_suffix(".tmp")
+        tmp_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(tmp_file, self.storage_file)
 
     def load(self):
         if not self.storage_file.exists():
@@ -284,14 +377,27 @@ class PortfolioManager:
             self.initial_capital_inr = data.get("initial_capital_inr", self.initial_capital_inr)
             self.available_cash_inr = data.get("available_cash_inr", self.available_cash_inr)
             self.available_cash_usd = data.get("available_cash_usd", self.available_cash_usd)
+            self.balance_polymarket_usd = data.get("balance_polymarket_usd", round(self.available_cash_usd / 2.0, 2))
+            self.balance_kalshi_usd = data.get("balance_kalshi_usd", round(self.available_cash_usd / 2.0, 2))
             self.realised_pnl_inr = data.get("realised_pnl_inr", 0.0)
             self.realised_pnl_usd = data.get("realised_pnl_usd", 0.0)
 
             def to_struct(d):
-                legs = [LegPosition(**l) for l in d.get("legs", [])]
+                legs = []
+                for l in d.get("legs", []):
+                    l_copy = dict(l)
+                    exp = l_copy.get("expiry") or ""
+                    l_copy["expiry"] = exp
+                    l_copy["expiry_display"] = l_copy.get("expiry_display") or format_expiry(exp)
+                    valid_leg_keys = LegPosition.__annotations__.keys()
+                    legs.append(LegPosition(**{k: v for k, v in l_copy.items() if k in valid_leg_keys}))
                 d_copy = dict(d)
                 d_copy["legs"] = legs
-                return StructurePosition(**d_copy)
+                exp_st = d_copy.get("expiry") or ""
+                d_copy["expiry"] = exp_st
+                d_copy["expiry_display"] = d_copy.get("expiry_display") or format_expiry(exp_st)
+                valid_keys = StructurePosition.__annotations__.keys()
+                return StructurePosition(**{k: v for k, v in d_copy.items() if k in valid_keys})
 
             self.open_structures = [to_struct(s) for s in data.get("open_structures", [])]
             self.realised_structures = [to_struct(s) for s in data.get("realised_structures", [])]
@@ -303,6 +409,8 @@ class PortfolioManager:
         """Reset portfolio back to initial state."""
         self.available_cash_inr = self.initial_capital_inr
         self.available_cash_usd = self.initial_capital_usd
+        self.balance_polymarket_usd = round(self.initial_capital_usd / 2.0, 2)
+        self.balance_kalshi_usd = round(self.initial_capital_usd / 2.0, 2)
         self.realised_pnl_inr = 0.0
         self.realised_pnl_usd = 0.0
         self.open_structures.clear()
@@ -326,6 +434,7 @@ ACTUAL_DATA_TEMPLATES = [
                 "side": "NO",
                 "entry_price_usd": 0.942,
                 "shares": 15.0,
+                "expiry": "2027-01-01T04:59:00Z",
             },
             {
                 "market_id": "0xe1779ab59d1c8472852a843d3b6f69e7921c4c34d4f778b6be0e9b468986f45f",
@@ -334,6 +443,7 @@ ACTUAL_DATA_TEMPLATES = [
                 "side": "YES",
                 "entry_price_usd": 0.038,
                 "shares": 15.0,
+                "expiry": "2028-01-01T04:59:00Z",
             }
         ]
     },
@@ -350,6 +460,7 @@ ACTUAL_DATA_TEMPLATES = [
                 "side": "NO",
                 "entry_price_usd": 0.440,
                 "shares": 20.0,
+                "expiry": "2027-01-01T00:00:00Z",
             },
             {
                 "market_id": "kalshi:BTC-26DEC-90K",
@@ -358,6 +469,7 @@ ACTUAL_DATA_TEMPLATES = [
                 "side": "YES",
                 "entry_price_usd": 0.510,
                 "shares": 20.0,
+                "expiry": "2027-01-01T00:00:00Z",
             }
         ]
     },
@@ -374,6 +486,7 @@ ACTUAL_DATA_TEMPLATES = [
                 "side": "NO",
                 "entry_price_usd": 0.460,
                 "shares": 18.0,
+                "expiry": "2026-12-18T20:00:00Z",
             },
             {
                 "market_id": "kalshi:FED-26DEC-CUT",
@@ -382,6 +495,7 @@ ACTUAL_DATA_TEMPLATES = [
                 "side": "YES",
                 "entry_price_usd": 0.490,
                 "shares": 18.0,
+                "expiry": "2026-12-18T20:00:00Z",
             }
         ]
     },
@@ -398,6 +512,7 @@ ACTUAL_DATA_TEMPLATES = [
                 "side": "NO",
                 "entry_price_usd": 0.940,
                 "shares": 12.0,
+                "expiry": "2026-08-01T04:59:00Z",
             },
             {
                 "market_id": "0xc281ddf56886ce5d1dcbfad73c9cb457e8789ed5adff29f95a7b8bcbfeb6ae26",
@@ -406,6 +521,7 @@ ACTUAL_DATA_TEMPLATES = [
                 "side": "YES",
                 "entry_price_usd": 0.039,
                 "shares": 12.0,
+                "expiry": "2027-01-01T04:59:00Z",
             }
         ]
     }

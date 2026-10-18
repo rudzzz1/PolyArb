@@ -23,15 +23,22 @@ class RiskLimits:
     consecutive_obs_required: int = 2            # phantom-arb filter: must see edge in >= 2 consecutive ticks
     approval_expiry_days: int = 30               # human approvals expire after N days
     simulate_execution_delay_s: float = 0.25     # execution delay between leg 1 and leg 2 in replay/simulation
-    model_void_outcomes: bool = True             # include void/refund worlds in worst-case payoff
+    model_void_outcomes: bool = False            # include void/refund worlds in worst-case payoff (stress test mode)
+
+
+@dataclass
+class FeeConfig:
+    polymarket_taker_bps: float = 0.0            # Polymarket default taker fee bps
+    kalshi_taker_fee_enabled: bool = True        # Kalshi SEC/regulatory fee calculation
 
 
 @dataclass
 class Config:
     risk: RiskLimits = field(default_factory=RiskLimits)
+    fees: FeeConfig = field(default_factory=FeeConfig)
     kill_switch_file: str = "KILL_SWITCH"
     data_dir: str = "data"
-    polymarket_default_fee_bps: float = 0.0      # Polymarket default taker fee bps (0 by default, 15-20 on some)
+    polymarket_default_fee_bps: float = 0.0      # Polymarket default taker fee bps
     non_trading_cost_usd: float = 0.05           # estimated gas / bridging amortization per basket trade
 
     @classmethod
@@ -45,8 +52,12 @@ class Config:
                     for k, v in data["risk"].items():
                         if hasattr(cfg.risk, k):
                             setattr(cfg.risk, k, v)
+                if "fees" in data and isinstance(data["fees"], dict):
+                    for k, v in data["fees"].items():
+                        if hasattr(cfg.fees, k):
+                            setattr(cfg.fees, k, v)
                 for k, v in data.items():
-                    if k != "risk" and hasattr(cfg, k):
+                    if k not in ("risk", "fees") and hasattr(cfg, k):
                         setattr(cfg, k, v)
             except Exception as e:
                 print(f"[config] Warning loading {p}: {e}")

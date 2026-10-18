@@ -68,6 +68,27 @@ def test_capital_limit_enforcement():
         assert len(pm.open_structures) == 0
 
 
+def test_expiry_tracking():
+    with tempfile.TemporaryDirectory() as tmp:
+        pm = PortfolioManager(initial_capital_inr=10000.0, data_dir=tmp)
+        t = ACTUAL_DATA_TEMPLATES[0]
+        st = pm.book_structure(t["kind"], t["event_title"], t["relation_id"], t["legs"], t["note"])
+        assert st is not None
+        assert st.expiry != ""
+        assert st.expiry_display != ""
+        for leg in st.legs:
+            assert leg.expiry != ""
+            assert leg.expiry_display != ""
+
+        # Test reload from disk retains expiry
+        pm2 = PortfolioManager(initial_capital_inr=10000.0, data_dir=tmp)
+        assert len(pm2.open_structures) == 1
+        st2 = pm2.open_structures[0]
+        assert st2.expiry == st.expiry
+        assert st2.expiry_display == st.expiry_display
+        assert st2.legs[0].expiry == st.legs[0].expiry
+
+
 if __name__ == "__main__":
     test_portfolio_inr_capital_and_booking()
     print("ok test_portfolio_inr_capital_and_booking")
@@ -75,3 +96,5 @@ if __name__ == "__main__":
     print("ok test_strict_all_legs_settled_rule")
     test_capital_limit_enforcement()
     print("ok test_capital_limit_enforcement")
+    test_expiry_tracking()
+    print("ok test_expiry_tracking")
