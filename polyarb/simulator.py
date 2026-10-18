@@ -19,8 +19,9 @@ from pathlib import Path
 from typing import Any
 
 from .config import Config, is_kill_switch_active
+from .fx import get_current_fx_rate, FxService
 
-INR_PER_USD = 83.50  # 1 USD = 83.50 INR
+INR_PER_USD = 83.50  # Baseline fallback constant; dynamic rates used at runtime via get_current_fx_rate()
 
 
 def format_expiry(iso_str: str | None) -> str:
@@ -107,7 +108,8 @@ class StructurePosition:
 class PortfolioManager:
     def __init__(self, initial_capital_inr: float = 10000.0, data_dir: str = "data"):
         self.initial_capital_inr = initial_capital_inr
-        self.initial_capital_usd = round(initial_capital_inr / INR_PER_USD, 2)
+        fx_rate = get_current_fx_rate()
+        self.initial_capital_usd = round(initial_capital_inr / fx_rate, 2)
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.storage_file = self.data_dir / "portfolio.json"
@@ -146,6 +148,7 @@ class PortfolioManager:
         locked_inr = self.get_locked_capital_inr()
         locked_usd = self.get_locked_capital_usd()
         poly_locked, kalshi_locked = self.get_locked_capital_per_venue()
+        fx_rate = get_current_fx_rate()
         return {
             "initial_capital_inr": self.initial_capital_inr,
             "initial_capital_usd": self.initial_capital_usd,
@@ -165,7 +168,8 @@ class PortfolioManager:
             "realised_count": len(self.realised_structures),
             "pending_count": len(self.pending_orders),
             "kill_switch_active": is_kill_switch_active(self.data_dir),
-            "inr_per_usd": INR_PER_USD,
+            "inr_per_usd": fx_rate,
+            "fx_status": FxService.get_instance().get_status(),
         }
 
     def book_structure(self, kind: str, event_title: str, relation_id: str,
@@ -175,9 +179,10 @@ class PortfolioManager:
         if is_kill_switch_active(self.data_dir):
             return None
 
+        fx_rate = get_current_fx_rate()
         # Calculate costs per leg and per venue
         total_cost_usd = sum(l["shares"] * l["entry_price_usd"] for l in legs_info)
-        total_cost_inr = round(total_cost_usd * INR_PER_USD, 2)
+        total_cost_inr = round(total_cost_usd * fx_rate, 2)
 
         if total_cost_inr > self.available_cash_inr:
             return None  # Exceeds available capital
@@ -203,7 +208,7 @@ class PortfolioManager:
         # Guaranteed minimum payoff based on exact basket payoff (Phase 0.3)
         shares = legs_info[0]["shares"] if legs_info else 0.0
         payoff_usd = round(unit_payoff * shares, 4)
-        payoff_inr = round(payoff_usd * INR_PER_USD, 2)
+        payoff_inr = round(payoff_usd * fx_rate, 2)
 
         profit_usd = round(payoff_usd - total_cost_usd, 4)
         profit_inr = round(payoff_inr - total_cost_inr, 2)
@@ -216,7 +221,7 @@ class PortfolioManager:
         struct_expiry = None
         for idx, l in enumerate(legs_info):
             c_usd = round(l["shares"] * l["entry_price_usd"], 4)
-            c_inr = round(c_usd * INR_PER_USD, 2)
+            c_inr = round(c_usd * fx_rate, 2)
             exp = l.get("expiry") or ""
             exp_disp = format_expiry(exp)
             if exp and (not struct_expiry or exp > struct_expiry):
@@ -278,6 +283,7 @@ class PortfolioManager:
         if not leg or leg.settlement_status == "SETTLED":
             return False
 
+        fx_rate = get_current_fx_rate()
         leg.settlement_status = "SETTLED"
         leg.settlement_outcome = outcome
         if outcome == leg.side:
@@ -286,7 +292,7 @@ class PortfolioManager:
             leg.payoff_usd = round(0.5 * leg.shares, 4)
         else:
             leg.payoff_usd = 0.0
-        leg.payoff_inr = round(leg.payoff_usd * INR_PER_USD, 2)
+        leg.payoff_inr = round(leg.payoff_usd * fx_rate, 2)
 
         # Credit venue balance
         if leg.venue == "polymarket":
@@ -315,6 +321,7 @@ class PortfolioManager:
         if not struct:
             return False
 
+        fx_rate = get_current_fx_rate()
         target_payoff_usd = struct.guaranteed_payoff_usd
         for idx, leg in enumerate(struct.legs):
             if leg.settlement_status != "SETTLED":
@@ -332,7 +339,7 @@ class PortfolioManager:
                     else:
                         leg.settlement_outcome = "NO" if leg.side == "YES" else "YES"
                         leg.payoff_usd = 0.0
-                leg.payoff_inr = round(leg.payoff_usd * INR_PER_USD, 2)
+                leg.payoff_inr = round(leg.payoff_usd * fx_rate, 2)
                 if leg.venue == "polymarket":
                     self.balance_polymarket_usd += leg.payoff_usd
                 elif leg.venue == "kalshi":

@@ -1107,7 +1107,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const poller = data.poller || {};
 
       document.getElementById('initCap').innerText = '₹' + s.initial_capital_inr.toLocaleString('en-IN', {minimumFractionDigits: 2});
-      document.getElementById('initCapUsd').innerText = '≈ $' + s.initial_capital_usd.toFixed(2) + ' USD';
+      const fxRate = s.inr_per_usd ? s.inr_per_usd.toFixed(2) : '83.50';
+      const fxSrc = (s.fx_status && s.fx_status.source) ? ` [${s.fx_status.source}]` : '';
+      document.getElementById('initCapUsd').innerText = `≈ $${s.initial_capital_usd.toFixed(2)} USD (@ ₹${fxRate}${fxSrc})`;
       document.getElementById('availCash').innerText = '₹' + s.available_cash_inr.toLocaleString('en-IN', {minimumFractionDigits: 2});
       document.getElementById('availCashUsd').innerText = '$' + s.available_cash_usd.toFixed(2) + ' USD';
       document.getElementById('venueSplit').innerText = `Poly: $${(s.balance_polymarket_usd||0).toFixed(2)} | Kalshi: $${(s.balance_kalshi_usd||0).toFixed(2)}`;

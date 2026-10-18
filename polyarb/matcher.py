@@ -23,8 +23,39 @@ POS_WORDS = set("win wins won pass passes passed above over exceed exceeds "
                 "reach reaches reached hit hits at_least".split())
 
 
+ENTITY_ALIASES = {
+    "btc": "bitcoin",
+    "eth": "ethereum",
+    "sol": "solana",
+    "fed": "federal reserve",
+    "cpi": "inflation",
+    "gdp": "gross domestic product",
+    "ecb": "european central bank",
+    "boe": "bank of england",
+}
+
+REVERSE_ALIASES = {v: k for k, v in ENTITY_ALIASES.items()}
+
+
+def normalize_entity_name(text: str) -> str:
+    """Normalizes financial tickers, political names, and macroeconomic abbreviations (Phase 3.5)."""
+    clean = text.lower().strip()
+    words = clean.split()
+    norm = [ENTITY_ALIASES.get(w, w) for w in words]
+    return " ".join(norm)
+
+
 def toks(q: str) -> set[str]:
-    return {w for w in re.findall(r"[a-z0-9]+", q.lower()) if w not in STOP and not w.isdigit()}
+    raw_tokens = {w for w in re.findall(r"[a-z0-9]+", q.lower()) if w not in STOP and not w.isdigit()}
+    expanded = set(raw_tokens)
+    for w in raw_tokens:
+        if w in ENTITY_ALIASES:
+            for part in ENTITY_ALIASES[w].split():
+                if part not in STOP:
+                    expanded.add(part)
+        if w in REVERSE_ALIASES:
+            expanded.add(REVERSE_ALIASES[w])
+    return expanded
 
 
 def nums(q: str) -> set[str]:
@@ -226,4 +257,48 @@ def match(poly: dict, kalshi: dict, max_days=2, min_score=0.5) -> list[dict]:
                  "end": k_match.get("end"), "rules": k_match.get("resolution_rules", ""), "source": k_match.get("resolution_source", "")}
             ]
             out.append(rel)
+    return out
+
+
+
+
+
+
+def extract_series_slug(market: dict) -> str:
+    """Extracts structured series or event identifier before falling back to free text (Phase 3.5)."""
+    return (
+        market.get("series_ticker") or
+        market.get("event_ticker") or
+        market.get("ticker_name") or
+        market.get("group_slug") or
+        ""
+    ).lower().strip()
+
+
+def find_bracket_structures(markets: dict, min_legs: int = 3, max_legs: int = 6) -> list[dict]:
+    """Discovers mutually exclusive partition brackets from grouped series markets (Phase 3.4).
+    For example: Kalshi rate brackets or Polymarket categorical outcomes."""
+    groups = defaultdict(list)
+    for m in markets.values():
+        slug = extract_series_slug(m)
+        if slug:
+            groups[slug].append(m)
+        else:
+            event = (m.get("event") or m.get("event_title") or "").strip().lower()
+            if event and len(event) > 4:
+                groups[event].append(m)
+
+    out = []
+    for slug, mkts in groups.items():
+        if min_legs <= len(mkts) <= max_legs:
+            # Check if all share the same resolution date (within 1 day)
+            end_days = [day(m.get("end")) for m in mkts if m.get("end")]
+            if len(end_days) == len(mkts) and max(end_days) - min(end_days) <= 1:
+                rel = _rel(
+                    "partition",
+                    mkts,
+                    f"Bracket Partition structure across {len(mkts)} outcomes in series '{slug}'"
+                )
+                rel["risk_flags"] = ["BRACKET_PARTITION", "MULTI_LEG"]
+                out.append(rel)
     return out

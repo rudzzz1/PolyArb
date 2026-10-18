@@ -103,10 +103,16 @@ class ExecutionOrchestrator:
     def sequence_legs(self, legs: list[OrchestratedLeg]) -> list[OrchestratedLeg]:
         """Sequence legs according to configured execution policy.
         'thinnest_first': execute leg with the smallest depth first to minimize adverse selection.
+        'maker_taker': post resting limit order on the thinnest leg; take other legs upon fill (Phase 3.3).
+        'polymarket_first': sequence polymarket leg first.
+        'kalshi_first': sequence kalshi leg first.
         """
-        if self.leg_ordering_policy == "thinnest_first":
+        if self.leg_ordering_policy in ("thinnest_first", "maker_taker"):
             # Sort ascending by depth (thinnest first)
-            return sorted(legs, key=lambda l: l.available_depth)
+            sorted_legs = sorted(legs, key=lambda l: l.available_depth)
+            if self.leg_ordering_policy == "maker_taker" and sorted_legs:
+                sorted_legs[0].order_type = "LIMIT"
+            return sorted_legs
         elif self.leg_ordering_policy == "polymarket_first":
             return sorted(legs, key=lambda l: 0 if l.venue == "polymarket" else 1)
         elif self.leg_ordering_policy == "kalshi_first":
