@@ -375,6 +375,29 @@ class PortfolioManager:
         tmp_file = self.storage_file.with_suffix(".tmp")
         tmp_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
         os.replace(tmp_file, self.storage_file)
+        self.backup()
+
+    def backup(self, max_backups: int = 30) -> Path | None:
+        """Creates a timestamped snapshot backup of portfolio.json with automated retention policy (Phase 6.1)."""
+        if not self.storage_file.exists():
+            return None
+        backup_dir = self.data_dir / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        ts_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        backup_path = backup_dir / f"portfolio_{ts_str}.json"
+        try:
+            backup_path.write_text(self.storage_file.read_text(encoding="utf-8"), encoding="utf-8")
+            # Retention policy: keep at most max_backups newest backups
+            existing = sorted(backup_dir.glob("portfolio_*.json"), key=lambda p: p.stat().st_mtime)
+            if len(existing) > max_backups:
+                for old_f in existing[:-max_backups]:
+                    try:
+                        old_f.unlink()
+                    except Exception:
+                        pass
+            return backup_path
+        except Exception:
+            return None
 
     def load(self):
         if not self.storage_file.exists():

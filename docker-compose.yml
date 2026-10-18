@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  polyarb-terminal:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: polyarb-terminal
+    restart: unless-stopped
+    ports:
+      - "8085:8085"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - PYTHONUNBUFFERED=1
+      - POLYARB_EXECUTION_MODE=HUMAN_APPROVAL
+      - POLYARB_JURISDICTION=IN
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8085/api/portfolio"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

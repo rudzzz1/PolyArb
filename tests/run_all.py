@@ -29,6 +29,7 @@ test_files = [
     "tests/test_costs.py",
     "tests/test_analytics.py",
     "tests/test_server.py",
+    "tests/test_hardening.py",
 ]
 
 if __name__ == "__main__":

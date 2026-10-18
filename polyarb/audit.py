@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .logger import get_logger
+from .migrations import SchemaMigrator
 
 logger = get_logger("audit")
 
@@ -50,43 +51,8 @@ class AuditLog:
     def _init_db(self):
         conn = self._get_conn()
         try:
-            with conn:
-                # 1. Main audit log table
-                conn.execute("""
-                CREATE TABLE IF NOT EXISTS audit_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ts TEXT NOT NULL,
-                    action TEXT NOT NULL,
-                    venue TEXT NOT NULL,
-                    market_id TEXT,
-                    side TEXT,
-                    price REAL,
-                    size REAL,
-                    order_id TEXT,
-                    fill_qty REAL,
-                    fill_price REAL,
-                    status TEXT,
-                    raw_response_hash TEXT,
-                    metadata TEXT
-                );
-                """)
-
-                # 2. Database triggers enforcing IMMUTABILITY (strict append-only)
-                conn.execute("""
-                CREATE TRIGGER IF NOT EXISTS audit_no_update
-                BEFORE UPDATE ON audit_log
-                BEGIN
-                    SELECT RAISE(ABORT, 'IMMUTABILITY VIOLATION: Updates to audit_log are prohibited.');
-                END;
-                """)
-
-                conn.execute("""
-                CREATE TRIGGER IF NOT EXISTS audit_no_delete
-                BEFORE DELETE ON audit_log
-                BEGIN
-                    SELECT RAISE(ABORT, 'IMMUTABILITY VIOLATION: Deletions from audit_log are prohibited.');
-                END;
-                """)
+            # Run versioned migrations (Phase 6.2)
+            SchemaMigrator.apply_migrations(conn)
         finally:
             self._close_conn(conn)
 

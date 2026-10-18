@@ -3,6 +3,8 @@ Handles ISP/firewall DPI resets seamlessly on Windows and restricted networks.
 """
 from __future__ import annotations
 import json
+import os
+import random
 import socket
 import ssl
 import time
@@ -17,11 +19,26 @@ DEFAULT_HEADERS = {
 }
 
 _DNS_CACHE: dict[str, str] = {}
-_FALLBACK_IPS = {
+_DEFAULT_FALLBACK_IPS = {
     "gamma-api.polymarket.com": "172.64.153.51",
     "clob.polymarket.com": "104.18.34.205",
     "external-api.kalshi.com": "3.20.180.5",
 }
+
+
+def _get_fallback_ips() -> dict[str, str]:
+    """Returns fallback IP dictionary, overridable via POLYARB_FALLBACK_IPS env var."""
+    custom = os.environ.get("POLYARB_FALLBACK_IPS", "")
+    res = dict(_DEFAULT_FALLBACK_IPS)
+    if custom:
+        for pair in custom.split(","):
+            if "=" in pair:
+                h, ip = pair.split("=", 1)
+                res[h.strip()] = ip.strip()
+            elif ":" in pair:
+                h, ip = pair.split(":", 1)
+                res[h.strip()] = ip.strip()
+    return res
 
 
 def _resolve_host(host: str) -> str:
@@ -41,8 +58,9 @@ def _resolve_host(host: str) -> str:
             return ip
     except Exception:
         pass
-    if host in _FALLBACK_IPS:
-        return _FALLBACK_IPS[host]
+    fallbacks = _get_fallback_ips()
+    if host in fallbacks:
+        return fallbacks[host]
     return socket.gethostbyname(host)
 
 
@@ -139,8 +157,8 @@ def _raw_https_get(host: str, path: str, timeout: float = 12.0) -> bytes:
     return body
 
 
-def http_get(url: str, params: dict | None = None, timeout: float = 12.0) -> Any:
-    """Robust HTTP GET with automatic fallback to DPI-bypassing transport."""
+def http_get(url: str, params: dict | None = None, timeout: float = 12.0, max_retries: int = 3) -> Any:
+    """Robust HTTP GET with automatic TLS fragmentation, proxy support, and exponential backoff with jitter."""
     if params:
         query_str = urllib.parse.urlencode(params)
         url += ("&" if "?" in url else "?") + query_str
@@ -149,21 +167,40 @@ def http_get(url: str, params: dict | None = None, timeout: float = 12.0) -> Any
     host = parsed.netloc
     path = parsed.path + ("?" + parsed.query if parsed.query else "")
 
-    # Always use the reliable TLS transport for Polymarket and Kalshi
-    if "polymarket.com" in host or "kalshi.com" in host:
+    # Configurable proxy support (Phase 6.4)
+    proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("ALL_PROXY")
+
+    # TLS-splitting transport for Polymarket and Kalshi when not behind explicit HTTP proxy
+    if not proxy_url and ("polymarket.com" in host or "kalshi.com" in host):
         last_err = None
-        for attempt in range(3):
+        for attempt in range(max_retries):
             try:
                 raw_bytes = _raw_https_get(host, path, timeout=timeout)
                 text = raw_bytes.decode("utf-8", errors="ignore")
                 return json.loads(text)
             except Exception as e:
                 last_err = e
-                time.sleep(0.2 * (attempt + 1))
+                # Exponential backoff with random jitter
+                backoff = min(2.0, (0.15 * (2 ** attempt)) + random.uniform(0.01, 0.05))
+                time.sleep(backoff)
         if last_err:
             raise last_err
 
-    # Standard urllib for other endpoints
+    # Standard urllib with proxy and retry support for other endpoints or when proxy is set
     req = urllib.request.Request(url, headers=DEFAULT_HEADERS)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.load(r)
+    opener = urllib.request.build_opener()
+    if proxy_url:
+        opener.add_handler(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
+
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            with opener.open(req, timeout=timeout) as r:
+                return json.load(r)
+        except Exception as e:
+            last_err = e
+            backoff = min(2.0, (0.15 * (2 ** attempt)) + random.uniform(0.01, 0.05))
+            time.sleep(backoff)
+
+    if last_err:
+        raise last_err
