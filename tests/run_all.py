@@ -23,6 +23,10 @@ test_files = [
     "tests/test_allocator.py",
     "tests/test_optimizer.py",
     "tests/test_bracket_matcher.py",
+    "tests/test_kalshi_ws.py",
+    "tests/test_manifold.py",
+    "tests/test_settlement.py",
+    "tests/test_costs.py",
 ]
 
 if __name__ == "__main__":

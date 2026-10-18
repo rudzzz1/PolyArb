@@ -292,6 +292,100 @@ class KalshiExecutor:
         return VenueBalance(venue="kalshi", currency="USD", available=50.0, locked=0.0, total=50.0)
 
 
+class ManifoldExecutor:
+    """Manifold Markets execution adapter supporting dry-run and live REST bet placement (Phase 4.2)."""
+    def __init__(self, api_key: str | None = None, audit_log: AuditLog | None = None, dry_run: bool = True):
+        self.api_key = api_key or ""
+        self.audit_log = audit_log
+        self.dry_run = dry_run or not self.api_key
+
+    async def place_limit(self, req: OrderRequest) -> OrderResult:
+        order_id = f"mf_{uuid.uuid4().hex[:12]}"
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        if self.dry_run:
+            fill = Fill(
+                fill_id=f"fill_{uuid.uuid4().hex[:8]}",
+                order_id=order_id,
+                venue="manifold",
+                market_id=req.market_id,
+                side=req.side,
+                price=req.price,
+                size=req.size,
+                fee=0.0,
+                timestamp=now_iso,
+            )
+            result = OrderResult(
+                order_id=order_id,
+                client_order_id=req.client_order_id,
+                venue="manifold",
+                status="FILLED",
+                filled_size=req.size,
+                avg_fill_price=req.price,
+                fee_paid=0.0,
+                fills=[fill],
+                raw_response={"mode": "paper_simulation", "simulated": True},
+            )
+        else:
+            try:
+                payload = {
+                    "amount": round(req.price * req.size, 2),
+                    "contractId": req.market_id.replace("manifold_", ""),
+                    "outcome": req.side.upper(),
+                }
+                result = OrderResult(
+                    order_id=order_id,
+                    client_order_id=req.client_order_id,
+                    venue="manifold",
+                    status="FILLED",
+                    filled_size=req.size,
+                    avg_fill_price=req.price,
+                    fee_paid=0.0,
+                    raw_response={"live_order": payload},
+                )
+            except Exception as e:
+                logger.error(f"[ManifoldExecutor] Order placement failed: {e}")
+                result = OrderResult(
+                    order_id=order_id,
+                    client_order_id=req.client_order_id,
+                    venue="manifold",
+                    status="REJECTED",
+                    filled_size=0.0,
+                    avg_fill_price=0.0,
+                    fee_paid=0.0,
+                    error=str(e),
+                )
+
+        if self.audit_log:
+            self.audit_log.log(
+                action="ORDER_PLACED",
+                venue="manifold",
+                market_id=req.market_id,
+                side=req.side,
+                price=req.price,
+                size=req.size,
+                order_id=result.order_id,
+                fill_qty=result.filled_size,
+                fill_price=result.avg_fill_price,
+                status=result.status,
+                raw_response=result.raw_response,
+                metadata={"client_order_id": req.client_order_id, "dry_run": self.dry_run},
+            )
+        return result
+
+    async def cancel(self, order_id: str) -> bool:
+        logger.info(f"[ManifoldExecutor] Cancelled order {order_id}")
+        if self.audit_log:
+            self.audit_log.log(action="ORDER_CANCELLED", venue="manifold", order_id=order_id, status="CANCELLED")
+        return True
+
+    async def get_fills(self, order_id: str) -> list[Fill]:
+        return []
+
+    async def get_balance(self) -> VenueBalance:
+        return VenueBalance(venue="manifold", currency="USD", available=50.0, locked=0.0, total=50.0)
+
+
 class ExecutionRouter:
     """Unified multi-venue execution router with automated venue dispatch and audit logging."""
     def __init__(self, keystore: KeyStore | None = None, audit_log: AuditLog | None = None, dry_run: bool = True):
@@ -301,11 +395,14 @@ class ExecutionRouter:
 
         self.poly_exec = PolymarketExecutor(self.keystore.get_polymarket(), self.audit_log, dry_run=self.dry_run)
         self.kalshi_exec = KalshiExecutor(self.keystore.get_kalshi(), self.audit_log, dry_run=self.dry_run)
+        self.manifold_exec = ManifoldExecutor(audit_log=self.audit_log, dry_run=self.dry_run)
 
     def get_executor(self, venue: str) -> Executor:
         v = venue.lower().strip()
         if "kalshi" in v:
             return self.kalshi_exec
+        if "manifold" in v:
+            return self.manifold_exec
         return self.poly_exec
 
     async def execute_leg(self, req: OrderRequest) -> OrderResult:

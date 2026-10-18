@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from . import gamma, kalshi, matcher, venues
+from . import gamma, kalshi, manifold, matcher, venues
 from .config import Config, is_kill_switch_active
 from .core import best_basket, sweep_with_limits, validate_book
 from .matcher import parse_datetime, is_approval_expired
@@ -29,6 +29,8 @@ from .logger import get_logger, set_trace_id
 from .allocator import OpportunityScorer, CapitalAllocator, ScoredOpportunity, AllocatedOpportunity
 from .optimizer import MathematicalOptimizer, OptimizationConstraint, OptimizedSizingResult
 from .fx import get_current_fx_rate
+from .settlement import SettlementMonitor
+from .costs import get_non_trading_cost
 
 logger = get_logger("poller")
 
@@ -41,7 +43,8 @@ class LiveMarketPoller:
                  approval_gate: ApprovalGate | None = None,
                  reconciliation_mgr: ReconciliationManager | None = None,
                  alert_mgr: AlertManager | None = None,
-                 allocator: CapitalAllocator | None = None):
+                 allocator: CapitalAllocator | None = None,
+                 settlement_monitor: SettlementMonitor | None = None):
         self.portfolio = portfolio
         self.interval_sec = interval_sec
         self.cfg = cfg or Config()
@@ -57,6 +60,11 @@ class LiveMarketPoller:
         self.approval_gate = approval_gate or ApprovalGate(audit_log=self.audit_log, mode="PAPER")
         self.reconciliation_mgr = reconciliation_mgr or ReconciliationManager(audit_log=self.audit_log, alert_mgr=self.alert_mgr)
         self.allocator = allocator or CapitalAllocator(cfg=self.cfg)
+        self.settlement_monitor = settlement_monitor or SettlementMonitor(
+            portfolio=self.portfolio,
+            alert_mgr=self.alert_mgr,
+            audit_log=self.audit_log,
+        )
 
         self.running = False
         self._thread: threading.Thread | None = None
@@ -66,7 +74,7 @@ class LiveMarketPoller:
         self.candidates_identified: int = 0
         self.trades_booked: int = 0
         self.last_status: str = "Initialized"
-        self.active_sources: list[str] = ["Polymarket (Gamma + CLOB)", "Kalshi (REST)"]
+        self.active_sources: list[str] = ["Polymarket (Gamma + CLOB)", "Kalshi (REST + WS)", "Manifold (REST)"]
         self.booked_relations: set[str] = set()
 
         # Seed already booked relations from portfolio
@@ -122,7 +130,15 @@ class LiveMarketPoller:
         except Exception as e:
             logger.warning(f"Kalshi fetch warning: {e}")
 
-        total_live_mkts = len(poly_markets) + len(kalshi_markets)
+        # 2b. Fetch live markets from Manifold Markets (Phase 4.2)
+        manifold_markets = {}
+        try:
+            mf_raw = manifold.fetch_markets(limit=30)
+            manifold_markets = manifold.load_markets(mf_raw)
+        except Exception as e:
+            logger.debug(f"Manifold fetch warning: {e}")
+
+        total_live_mkts = len(poly_markets) + len(kalshi_markets) + len(manifold_markets)
         if total_live_mkts == 0:
             self.last_status = "No live markets retrieved (retrying next tick)"
             return {"status": "no_markets"}
@@ -132,7 +148,7 @@ class LiveMarketPoller:
         if poly_markets:
             cands.extend(gamma.candidates(poly_markets))
 
-        all_mkts = {**poly_markets, **kalshi_markets}
+        all_mkts = {**poly_markets, **kalshi_markets, **manifold_markets}
         if len(all_mkts) > 1:
             try:
                 threshold_ladders = matcher.find_threshold_ladders(all_mkts)
@@ -152,6 +168,20 @@ class LiveMarketPoller:
                 cands.extend(cross_matches)
             except Exception as e:
                 logger.warning(f"Cross-venue matcher warning: {e}")
+
+        if poly_markets and manifold_markets:
+            try:
+                poly_mf_matches = matcher.match(poly_markets, manifold_markets, max_days=3, min_score=0.45)
+                cands.extend(poly_mf_matches)
+            except Exception as e:
+                logger.debug(f"Poly-Manifold matcher warning: {e}")
+
+        if kalshi_markets and manifold_markets:
+            try:
+                kalshi_mf_matches = matcher.match(kalshi_markets, manifold_markets, max_days=3, min_score=0.45)
+                cands.extend(kalshi_mf_matches)
+            except Exception as e:
+                logger.debug(f"Kalshi-Manifold matcher warning: {e}")
 
         self.candidates_identified += len(cands)
 
@@ -190,15 +220,21 @@ class LiveMarketPoller:
                 if booked_this_tick >= 2:
                     break
 
-        # 5. Check auto-settlement for expired structures
+        # 5. Cross-venue settlement reconciliation (Phase 4.3)
+        try:
+            self.settlement_monitor.reconcile_structure_settlements()
+        except Exception as e:
+            logger.debug(f"Settlement reconciliation warning: {e}")
+
         self._check_natural_expiry_settlements(now_dt)
 
-        self.last_status = f"Live active. Markets: {len(poly_markets)} Poly / {len(kalshi_markets)} Kalshi. Booked: {self.trades_booked} trades."
+        self.last_status = f"Live active. Markets: {len(poly_markets)} Poly / {len(kalshi_markets)} Kalshi / {len(manifold_markets)} Manifold. Booked: {self.trades_booked} trades."
         return {
             "status": "ok",
             "poll_count": self.poll_count,
             "poly_count": len(poly_markets),
             "kalshi_count": len(kalshi_markets),
+            "manifold_count": len(manifold_markets),
             "candidates_found": len(cands),
             "booked_this_tick": booked_this_tick,
             "total_booked": self.trades_booked,
@@ -266,6 +302,15 @@ class LiveMarketPoller:
             logger.warning(f"[ANOMALY CIRCUIT BREAKER] Rejected {cand['id']}: edge {bk.edge:.3f} > max {self.cfg.risk.max_anomaly_edge:.3f}")
             return None
 
+        # 6. Deduct Dynamic Gas and Non-Trading Costs (Phase 4.4)
+        venues_in_basket = {ms[i].get("venue", "polymarket") for i, _ in bk.legs}
+        primary_venue = "cross_venue" if len(venues_in_basket) > 1 else list(venues_in_basket)[0]
+        non_trading_cost = get_non_trading_cost(venue=primary_venue, leg_count=len(bk.legs))
+
+        if (bk.edge - non_trading_cost) < self.cfg.risk.min_edge:
+            logger.debug(f"Candidate {cand['id']} net edge after gas/fees {bk.edge - non_trading_cost:.4f} < min {self.cfg.risk.min_edge:.4f}")
+            return None
+
         event_title = ms[0].get("event_title") or f"{kind.title()} Arbitrage Structure"
         flags = list(cand.get("risk_flags", []))
         score, risk_factor = OpportunityScorer.calculate_score(
@@ -274,6 +319,7 @@ class LiveMarketPoller:
             apy=bk.annualized_return,
             days_to_res=days_to_res,
             risk_flags=flags,
+            non_trading_cost=non_trading_cost,
         )
 
         return ScoredOpportunity(

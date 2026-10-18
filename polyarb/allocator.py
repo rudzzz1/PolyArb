@@ -45,8 +45,9 @@ class OpportunityScorer:
     """Calculates risk-adjusted opportunity scores considering edge, capital velocity (APY), and risk flags."""
     @staticmethod
     def calculate_score(edge: float, cost: float, apy: float | None,
-                        days_to_res: float | None, risk_flags: list[str] | None = None) -> tuple[float, float]:
-        """Returns (score, risk_factor)."""
+                        days_to_res: float | None, risk_flags: list[str] | None = None,
+                        non_trading_cost: float = 0.0) -> tuple[float, float]:
+        """Returns (score, risk_factor). Deducts dynamic gas and non-trading costs from net edge."""
         flags = risk_flags or []
         risk_factor = 1.0
 
@@ -73,7 +74,8 @@ class OpportunityScorer:
         else:
             velocity_multiplier = 1.0
 
-        score = edge * velocity_multiplier * risk_factor
+        net_edge = max(0.0, edge - non_trading_cost)
+        score = net_edge * velocity_multiplier * risk_factor
         return round(score, 6), round(risk_factor, 4)
 
 

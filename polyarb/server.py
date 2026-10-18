@@ -544,6 +544,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     .badge-partial { background: var(--yellow-bg); color: var(--yellow); }
     .badge-polymarket { background: rgba(99, 102, 241, 0.15); color: #818cf8; }
     .badge-kalshi { background: rgba(236, 72, 153, 0.15); color: #f472b6; }
+    .badge-manifold { background: rgba(16, 185, 129, 0.15); color: #34d399; }
     .badge-yes { background: var(--green-bg); color: var(--green); }
     .badge-no { background: var(--purple-bg); color: #c084fc; }
     .badge-expiry { background: rgba(56, 189, 248, 0.1); color: #7dd3fc; border: 1px solid rgba(56, 189, 248, 0.2); }
@@ -1244,7 +1245,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     ${st.legs.map(l => `
                       <tr>
                         <td class="mono" style="color: var(--text-dim);">${l.leg_id}</td>
-                        <td><span class="badge ${l.venue === 'kalshi' ? 'badge-kalshi' : 'badge-polymarket'}">${l.venue}</span></td>
+                        <td><span class="badge ${l.venue === 'kalshi' ? 'badge-kalshi' : (l.venue === 'manifold' ? 'badge-manifold' : 'badge-polymarket')}">${l.venue}</span></td>
                         <td style="max-width: 300px;">${l.question}</td>
                         <td><span class="badge ${l.side === 'YES' ? 'badge-yes' : 'badge-no'}">${l.side}</span></td>
                         <td class="mono">${l.shares}</td>
