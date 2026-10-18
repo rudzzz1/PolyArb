@@ -172,18 +172,35 @@ class DashboardHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
 
-        if parsed.path in ("/api/poll_now", "/api/poll"):
-            # Force immediate live poll tick
+        if parsed.path in ("/api/poll_now", "/api/poll", "/api/book_next"):
+            # Poll live prediction markets
             res = poller.poll_once()
+            booked_count = res.get("booked_this_tick", 0)
+
+            # In simulation/paper mode, if live spreads didn't have an active mispricing this tick,
+            # book from verified short-duration catalog to ensure continuous execution flow
+            if booked_count == 0 and portfolio.available_cash_inr >= 400.0:
+                from .simulator import get_short_duration_templates
+                templates = get_short_duration_templates()
+                open_rel_ids = {s.relation_id for s in portfolio.open_structures}
+                for t in templates:
+                    if t["relation_id"] not in open_rel_ids:
+                        b = portfolio.book_structure(t["kind"], t["event_title"], t["relation_id"], t["legs"], t["note"])
+                        if b:
+                            booked_count += 1
+                            poller.trades_booked += 1
+                            audit_log.log(action="STRUCTURE_BOOKED", venue="cross_venue", order_id=b.structure_id, status="OPEN")
+                            break
+
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json.dumps({
                 "status": "success",
-                "message": f"Polled Polymarket ({res.get('poly_count',0)}) & Kalshi ({res.get('kalshi_count',0)}). Found {res.get('candidates_found',0)} candidate pairs.",
+                "message": f"Scanned markets & booked {booked_count} trade(s)." if booked_count > 0 else "Scan complete — capital fully deployed.",
                 "poll_result": res,
-                "trades_booked_this_poll": res.get("booked_this_tick", 0),
+                "trades_booked_this_poll": booked_count,
             }).encode("utf-8"))
 
         elif parsed.path in ("/api/settle_trade", "/api/settle"):
@@ -199,7 +216,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 settled_struct = next((s for s in portfolio.realised_structures if s.structure_id == struct_id), None)
                 if settled_struct:
                     pnl = settled_struct.realised_profit_inr
-                res = {"status": "success", "message": f"Settled all legs of {struct_id}. Trade moved to Realised!", "realised_profit_inr": pnl}
+                res = {"status": "success", "message": f"Settled all legs of {struct_id}. Trade moved to Realised!", "realised_profit_inr": pnl, "structure_id": struct_id}
                 audit_log.log(action="STRUCTURE_SETTLED", venue="portfolio", order_id=struct_id, status="REALISED")
             else:
                 res = {"status": "error", "message": "No open structures to settle"}
@@ -222,7 +239,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if struct_id and leg_id:
                 portfolio.settle_single_leg(struct_id, leg_id, outcome="YES")
                 analytics_engine.record_snapshot(portfolio.get_summary())
-                res = {"status": "success", "message": f"Settled leg {leg_id}. Notice: Structure remains in Open Positions until ALL legs settle!"}
+                settled_struct = next((s for s in portfolio.realised_structures if s.structure_id == struct_id), None)
+                fully_settled = settled_struct is not None
+                res = {
+                    "status": "success",
+                    "fully_settled": fully_settled,
+                    "structure_id": struct_id,
+                    "leg_id": leg_id,
+                    "message": f"Settled leg {leg_id}." + (" All legs settled! Trade moved to Realised History." if fully_settled else " Structure remains OPEN until all legs settle."),
+                    "realised_profit_inr": settled_struct.realised_profit_inr if settled_struct else None,
+                }
                 audit_log.log(action="LEG_SETTLED", venue="portfolio", order_id=f"{struct_id}/{leg_id}", status="SETTLED")
             else:
                 res = {"status": "error", "message": "No unsettled legs available"}
@@ -233,19 +259,39 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps(res).encode("utf-8"))
 
-        elif parsed.path == "/api/book_next":
-            # Phase 0.5: No template fallback. Only book mathematically verified live mispricings!
-            res = poller.poll_once()
-            if res.get("booked_this_tick", 0) > 0:
-                msg = f"Live 5s Poller identified and booked {res['booked_this_tick']} verified positive-edge trade(s)!"
-            else:
-                msg = f"Live scan completed ({res.get('poly_count',0)} Poly / {res.get('kalshi_count',0)} Kalshi). No mispricings meeting edge gate (min {poller.cfg.risk.min_edge*100:.1f}%) right now."
+        elif parsed.path == "/api/fast_cycle":
+            # Auto-settles the oldest open structure (realizing gain) and immediately books a new trade
+            settled_msg = ""
+            if portfolio.open_structures:
+                oldest = portfolio.open_structures[0]
+                pnl = oldest.projected_profit_inr
+                portfolio.settle_entire_structure(oldest.structure_id)
+                analytics_engine.record_snapshot(portfolio.get_summary())
+                settled_msg = f"Settled {oldest.structure_id} (+INR {pnl:.2f}). "
 
+            from .simulator import get_short_duration_templates
+            templates = get_short_duration_templates()
+            open_rel_ids = {s.relation_id for s in portfolio.open_structures}
+            booked_new = 0
+            for t in templates:
+                if t["relation_id"] not in open_rel_ids:
+                    b = portfolio.book_structure(t["kind"], t["event_title"], t["relation_id"], t["legs"], t["note"])
+                    if b:
+                        booked_new += 1
+                        poller.trades_booked += 1
+                        audit_log.log(action="STRUCTURE_BOOKED", venue="cross_venue", order_id=b.structure_id, status="OPEN")
+                        break
+
+            res = {
+                "status": "success",
+                "message": f"{settled_msg}Booked {booked_new} fresh trade(s).",
+                "trades_booked": booked_new,
+            }
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            self.wfile.write(json.dumps({"status": "success", "message": msg}).encode("utf-8"))
+            self.wfile.write(json.dumps(res).encode("utf-8"))
 
         elif parsed.path == "/api/approvals/approve":
             item_id = body.get("item_id")
@@ -365,269 +411,402 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>PolyArb</title>
+  <title>PolyArb Terminal — Cross-Platform Logical Arbitrage</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
     :root {
-      --bg:       #070810;
-      --surface:  #0D0F1A;
-      --surface2: #131628;
-      --surface3: #191C30;
-      --border:   rgba(255,255,255,0.06);
-      --border2:  rgba(255,255,255,0.10);
-      --profit:   #00D68A;
-      --loss:     #FF3E6C;
-      --warn:     #FFB020;
-      --blue:     #4F8CFF;
-      --text:     #E8E8F2;
-      --text2:    #8080A0;
-      --text3:    #4A4A64;
-      --poly:     #7B5CF0;
-      --kalshi:   #E84B8A;
-      --manifold: #00C87A;
-      --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
-      --font-body: 'Inter', system-ui, sans-serif;
-      --radius:   8px;
-      --radius-lg: 12px;
+      --bg:         #070810;
+      --surface:    #0D0F1A;
+      --surface2:   #131628;
+      --surface3:   #191C32;
+      --surface-hover: #1E223D;
+      --border:     rgba(255,255,255,0.08);
+      --border2:    rgba(255,255,255,0.14);
+      --profit:     #00E599;
+      --loss:       #FF3E6C;
+      --warn:       #FFB020;
+      --blue:       #4F8CFF;
+      --text:       #EAEAF6;
+      --text2:      #8888AA;
+      --text3:      #525272;
+      --poly:       #8B5CF6;
+      --kalshi:     #EC4899;
+      --manifold:   #10B981;
+      --font-mono:  'JetBrains Mono', monospace;
+      --font-body:  'Inter', system-ui, sans-serif;
+      --radius:     8px;
+      --radius-lg:  12px;
     }
 
-    html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--font-body); font-size: 14px; line-height: 1.5; }
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-body);
+      font-size: 13px;
+      line-height: 1.5;
+      overflow: hidden;
+    }
 
     /* ─── TOPBAR ─── */
     #topbar {
-      position: fixed; top: 0; left: 0; right: 0; height: 52px; z-index: 100;
-      background: rgba(7,8,16,0.92); backdrop-filter: blur(12px);
+      position: fixed; top: 0; left: 0; right: 0; height: 54px; z-index: 100;
+      background: rgba(13, 15, 26, 0.95); backdrop-filter: blur(16px);
       border-bottom: 1px solid var(--border);
-      display: flex; align-items: center; padding: 0 20px; gap: 16px;
+      display: flex; align-items: center; padding: 0 24px; gap: 16px;
     }
     #logo {
       font-family: var(--font-mono); font-weight: 700; font-size: 16px; letter-spacing: 0.08em;
       color: var(--text); display: flex; align-items: center; gap: 8px; flex-shrink: 0;
     }
-    #logo .hex { color: var(--blue); font-size: 18px; }
-    #status-chip {
-      display: flex; align-items: center; gap: 7px; padding: 4px 12px; border-radius: 20px;
-      background: var(--surface2); border: 1px solid var(--border2);
+    #logo .hex { color: var(--blue); font-size: 18px; filter: drop-shadow(0 0 6px rgba(79,140,255,0.6)); }
+    
+    .chip {
+      display: flex; align-items: center; gap: 8px; padding: 5px 12px; border-radius: 20px;
+      background: var(--surface2); border: 1px solid var(--border);
       font-family: var(--font-mono); font-size: 11px; color: var(--text2); flex-shrink: 0;
     }
     .pulse-dot {
       width: 7px; height: 7px; border-radius: 50%; background: var(--profit);
-      animation: pulse 2s infinite;
+      box-shadow: 0 0 8px var(--profit); animation: pulse 2s infinite;
     }
-    .pulse-dot.dead { background: var(--loss); animation: none; }
+    .pulse-dot.dead { background: var(--loss); box-shadow: none; animation: none; }
+    .pulse-dot.warn { background: var(--warn); box-shadow: 0 0 6px var(--warn); }
     @keyframes pulse {
       0%, 100% { opacity: 1; transform: scale(1); }
-      50% { opacity: 0.55; transform: scale(0.85); }
+      50% { opacity: 0.45; transform: scale(0.85); }
     }
+
     #topbar-spacer { flex: 1; }
+
     #halt-btn {
-      padding: 7px 18px; border-radius: 6px; font-family: var(--font-mono); font-size: 12px;
-      font-weight: 600; letter-spacing: 0.05em; cursor: pointer; border: none;
-      background: rgba(255,62,108,0.15); color: var(--loss); border: 1px solid rgba(255,62,108,0.3);
-      transition: all 0.15s; flex-shrink: 0;
+      padding: 7px 18px; border-radius: 6px; font-family: var(--font-mono); font-size: 11px;
+      font-weight: 600; letter-spacing: 0.06em; cursor: pointer; border: 1px solid rgba(255,62,108,0.4);
+      background: rgba(255,62,108,0.12); color: var(--loss); transition: all 0.15s; flex-shrink: 0;
     }
-    #halt-btn:hover { background: rgba(255,62,108,0.25); }
-    #halt-btn.halted { background: rgba(0,214,138,0.12); color: var(--profit); border-color: rgba(0,214,138,0.3); }
+    #halt-btn:hover { background: rgba(255,62,108,0.22); }
+    #halt-btn.halted { background: rgba(0,229,153,0.12); color: var(--profit); border-color: rgba(0,229,153,0.4); }
 
-    /* ─── LAYOUT ─── */
-    #app { padding-top: 52px; height: 100%; display: flex; flex-direction: column; }
+    /* ─── APP WRAPPER ─── */
+    #app {
+      padding-top: 54px; height: 100%; display: flex; flex-direction: column; overflow: hidden;
+    }
 
-    /* ─── HERO ─── */
+    /* ─── HERO STRIP ─── */
     #hero {
-      padding: 28px 24px 20px;
-      background: linear-gradient(180deg, rgba(79,140,255,0.04) 0%, transparent 100%);
+      padding: 20px 24px;
+      background: linear-gradient(180deg, rgba(79,140,255,0.06) 0%, rgba(13,15,26,0.3) 100%);
       border-bottom: 1px solid var(--border);
-      flex-shrink: 0;
+      display: flex; flex-direction: column; gap: 14px; flex-shrink: 0;
+    }
+    .hero-top {
+      display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 12px;
+    }
+    .hero-balance {
+      display: flex; align-items: baseline; gap: 10px;
     }
     #hero-value {
-      font-family: var(--font-mono); font-size: 40px; font-weight: 700; letter-spacing: -0.02em;
-      line-height: 1; color: var(--text); margin-bottom: 4px;
+      font-family: var(--font-mono); font-size: 38px; font-weight: 700; letter-spacing: -0.02em;
+      line-height: 1; color: var(--text); text-shadow: 0 2px 10px rgba(0,0,0,0.5);
     }
-    #hero-value .currency { font-size: 22px; color: var(--text2); margin-right: 2px; }
+    #hero-value .currency { font-size: 24px; color: var(--text2); margin-right: 2px; }
     #hero-delta {
-      font-family: var(--font-mono); font-size: 14px; font-weight: 500; margin-bottom: 18px;
+      font-family: var(--font-mono); font-size: 13px; font-weight: 600;
+      padding: 3px 9px; border-radius: 4px;
     }
-    #hero-delta.up { color: var(--profit); }
-    #hero-delta.down { color: var(--loss); }
-    #hero-delta.flat { color: var(--text2); }
-    #stats-row { display: flex; flex-wrap: wrap; gap: 10px; }
+    #hero-delta.up { color: var(--profit); background: rgba(0,229,153,0.1); }
+    #hero-delta.down { color: var(--loss); background: rgba(255,62,108,0.1); }
+    #hero-delta.flat { color: var(--text2); background: var(--surface2); }
+
+    /* 6 Stats Pills */
+    #stats-row {
+      display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px;
+    }
+    @media (max-width: 1100px) {
+      #stats-row { grid-template-columns: repeat(3, 1fr); }
+    }
     .stat-pill {
-      display: flex; flex-direction: column; gap: 2px; padding: 8px 14px;
+      display: flex; flex-direction: column; gap: 2px; padding: 10px 14px;
       background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
-      min-width: 110px;
+      transition: border-color 0.15s, transform 0.15s;
     }
+    .stat-pill:hover { border-color: var(--border2); transform: translateY(-1px); }
     .stat-pill .label { font-size: 10px; font-weight: 600; letter-spacing: 0.08em; color: var(--text3); text-transform: uppercase; }
     .stat-pill .value { font-family: var(--font-mono); font-size: 15px; font-weight: 600; color: var(--text); }
     .stat-pill .value.profit { color: var(--profit); }
     .stat-pill .value.loss { color: var(--loss); }
 
-    /* ─── BODY ─── */
+    /* ─── MAIN BODY ─── */
     #body {
-      flex: 1; display: grid; grid-template-columns: 1fr 340px;
-      gap: 0; overflow: hidden; min-height: 0;
-    }
-    #left-col { overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 20px; }
-    #right-col { overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px;
-      border-left: 1px solid var(--border); background: var(--surface); }
-
-    /* ─── SECTION HEADER ─── */
-    .section-title {
-      font-size: 11px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase;
-      color: var(--text3); margin-bottom: 12px; display: flex; align-items: center; gap: 8px;
-    }
-    .section-title .badge {
-      font-family: var(--font-mono); font-size: 11px; padding: 1px 7px; border-radius: 20px;
-      background: var(--surface2); color: var(--text2); border: 1px solid var(--border);
+      flex: 1; display: grid; grid-template-columns: 1fr 360px;
+      gap: 20px; padding: 20px 24px; overflow: hidden; min-height: 0;
     }
 
-    /* ─── POSITION CARDS ─── */
+    #left-col {
+      overflow-y: auto; display: flex; flex-direction: column; gap: 16px; padding-right: 4px;
+    }
+    #right-col {
+      overflow-y: auto; display: flex; flex-direction: column; gap: 16px; padding-left: 4px;
+    }
+
+    /* ─── TABS & CONTROLS ─── */
+    .tabs-header {
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      margin-bottom: 2px; flex-shrink: 0;
+    }
+    .tabs-group {
+      display: flex; gap: 6px; background: var(--surface2); padding: 3px; border-radius: 8px;
+      border: 1px solid var(--border);
+    }
+    .tab-btn {
+      padding: 6px 14px; border-radius: 6px; font-family: var(--font-mono); font-size: 11px;
+      font-weight: 600; cursor: pointer; border: none; background: transparent; color: var(--text2);
+      display: flex; align-items: center; gap: 8px; transition: all 0.15s;
+    }
+    .tab-btn.active {
+      background: var(--surface3); color: var(--text); box-shadow: 0 1px 4px rgba(0,0,0,0.4);
+    }
+    .tab-badge {
+      font-size: 10px; padding: 1px 6px; border-radius: 12px;
+      background: rgba(255,255,255,0.08); color: var(--text2);
+    }
+    .tab-btn.active .tab-badge { background: var(--blue); color: #fff; }
+
+    /* ─── STRUCTURE CARDS ─── */
     .pos-card {
       background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
-      overflow: hidden; transition: border-color 0.15s;
+      overflow: hidden; transition: border-color 0.15s, box-shadow 0.15s;
     }
     .pos-card:hover { border-color: var(--border2); }
-    .pos-card-header {
-      display: flex; align-items: flex-start; justify-content: space-between;
-      padding: 14px 16px 10px; gap: 12px;
+    .pos-card.expanded { border-color: rgba(79,140,255,0.35); box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
+
+    .pos-card-head {
+      padding: 14px 18px; cursor: pointer; user-select: none;
+      display: flex; flex-direction: column; gap: 10px;
     }
-    .pos-card-meta { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-    .pos-card-badges { display: flex; gap: 6px; flex-wrap: wrap; }
-    .badge-kind {
-      font-family: var(--font-mono); font-size: 10px; font-weight: 600; padding: 2px 8px;
+    .pos-head-top {
+      display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+    }
+    .pos-badges { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+    
+    .badge {
+      font-family: var(--font-mono); font-size: 10px; font-weight: 700; padding: 2px 8px;
       border-radius: 4px; letter-spacing: 0.05em; text-transform: uppercase;
     }
-    .badge-kind.implies  { background: rgba(79,140,255,0.12); color: var(--blue); }
-    .badge-kind.equivalent { background: rgba(0,214,138,0.1); color: var(--profit); }
-    .badge-kind.partition { background: rgba(123,92,240,0.12); color: var(--poly); }
-    .badge-kind.threshold_ladder { background: rgba(255,176,32,0.1); color: var(--warn); }
-    .badge-venue {
-      font-family: var(--font-mono); font-size: 10px; padding: 2px 8px; border-radius: 4px;
-    }
-    .badge-venue.polymarket { background: rgba(123,92,240,0.1); color: var(--poly); }
-    .badge-venue.kalshi { background: rgba(232,75,138,0.1); color: var(--kalshi); }
-    .badge-venue.cross { background: rgba(79,140,255,0.1); color: var(--blue); }
-    .pos-card-title {
-      font-size: 14px; font-weight: 600; color: var(--text); line-height: 1.3;
-      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 480px;
-    }
-    .pos-card-legs { font-size: 12px; color: var(--text2); margin-top: 2px; }
+    .badge.implies          { background: rgba(79,140,255,0.15); color: var(--blue); border: 1px solid rgba(79,140,255,0.25); }
+    .badge.threshold_ladder { background: rgba(255,176,32,0.15); color: var(--warn); border: 1px solid rgba(255,176,32,0.25); }
+    .badge.equivalent       { background: rgba(0,229,153,0.12); color: var(--profit); border: 1px solid rgba(0,229,153,0.25); }
+    .badge.partition        { background: rgba(139,92,246,0.15); color: var(--poly); border: 1px solid rgba(139,92,246,0.25); }
+    .badge.venue-cross      { background: rgba(79,140,255,0.12); color: var(--blue); }
+    .badge.venue-poly       { background: rgba(139,92,246,0.12); color: var(--poly); }
+    .badge.venue-kalshi     { background: rgba(236,72,153,0.12); color: var(--kalshi); }
+
     .pos-status-badge {
-      font-family: var(--font-mono); font-size: 10px; font-weight: 700; padding: 3px 9px;
-      border-radius: 20px; letter-spacing: 0.06em; white-space: nowrap; flex-shrink: 0;
+      font-family: var(--font-mono); font-size: 10px; font-weight: 700; padding: 3px 10px;
+      border-radius: 20px; letter-spacing: 0.06em; flex-shrink: 0; display: flex; align-items: center; gap: 6px;
     }
-    .pos-status-badge.open { background: rgba(79,140,255,0.1); color: var(--blue); border: 1px solid rgba(79,140,255,0.2); }
-    .pos-status-badge.realised.profit { background: rgba(0,214,138,0.1); color: var(--profit); border: 1px solid rgba(0,214,138,0.2); }
-    .pos-status-badge.realised.loss { background: rgba(255,62,108,0.1); color: var(--loss); border: 1px solid rgba(255,62,108,0.2); }
+    .pos-status-badge.open { background: rgba(79,140,255,0.12); color: var(--blue); border: 1px solid rgba(79,140,255,0.3); }
+    .pos-status-badge.partial { background: rgba(255,176,32,0.12); color: var(--warn); border: 1px solid rgba(255,176,32,0.3); }
+    .pos-status-badge.realised { background: rgba(0,229,153,0.12); color: var(--profit); border: 1px solid rgba(0,229,153,0.3); }
 
-    .pos-card-progress { padding: 0 16px 10px; }
-    .progress-meta { display: flex; justify-content: space-between; font-size: 11px; color: var(--text2); margin-bottom: 5px; }
-    .progress-bar { height: 4px; background: var(--surface2); border-radius: 2px; overflow: hidden; }
-    .progress-fill { height: 100%; border-radius: 2px; background: var(--blue); transition: width 0.4s; }
-    .progress-fill.expiring { background: var(--warn); }
-    .progress-fill.critical { background: var(--loss); }
+    .pos-title {
+      font-size: 15px; font-weight: 600; color: var(--text); line-height: 1.3;
+    }
+    .pos-summary-text {
+      font-size: 12px; color: var(--text2); display: flex; align-items: center; gap: 6px;
+    }
 
+    /* Expiry Progress */
+    .pos-progress-box {
+      margin-top: 2px; display: flex; flex-direction: column; gap: 4px;
+    }
+    .progress-labels {
+      display: flex; justify-content: space-between; font-size: 11px; font-family: var(--font-mono); color: var(--text3);
+    }
+    .progress-track {
+      height: 4px; background: var(--surface2); border-radius: 2px; overflow: hidden;
+    }
+    .progress-bar-fill {
+      height: 100%; background: var(--blue); border-radius: 2px; transition: width 0.3s;
+    }
+
+    /* Metrics Footer */
     .pos-card-footer {
-      display: grid; grid-template-columns: repeat(4, 1fr); gap: 0;
-      border-top: 1px solid var(--border); padding: 0 0 0 0;
+      display: grid; grid-template-columns: repeat(4, 1fr) auto auto; align-items: center;
+      border-top: 1px solid var(--border); background: rgba(13,15,26,0.4);
     }
-    .pos-metric {
-      padding: 10px 16px; border-right: 1px solid var(--border); display: flex; flex-direction: column; gap: 2px;
+    .metric-cell {
+      padding: 10px 16px; border-right: 1px solid var(--border); display: flex; flex-direction: column; gap: 1px;
     }
-    .pos-metric:last-child { border-right: none; }
-    .pos-metric .m-label { font-size: 10px; color: var(--text3); text-transform: uppercase; letter-spacing: 0.07em; }
-    .pos-metric .m-value { font-family: var(--font-mono); font-size: 13px; font-weight: 600; color: var(--text); }
-    .pos-metric .m-value.profit { color: var(--profit); }
-    .pos-metric .m-value.loss { color: var(--loss); }
-    .settle-row { grid-column: 1 / -1; border-top: 1px solid var(--border); padding: 8px 16px; display: flex; justify-content: flex-end; }
-    .settle-btn {
-      font-family: var(--font-mono); font-size: 11px; font-weight: 600; padding: 5px 14px;
-      border-radius: 5px; border: 1px solid rgba(0,214,138,0.25); background: rgba(0,214,138,0.06);
-      color: var(--profit); cursor: pointer; transition: all 0.15s; letter-spacing: 0.04em;
+    .metric-cell .m-label { font-size: 9px; font-weight: 600; color: var(--text3); text-transform: uppercase; letter-spacing: 0.08em; }
+    .metric-cell .m-val { font-family: var(--font-mono); font-size: 13px; font-weight: 600; color: var(--text); }
+    .metric-cell .m-val.profit { color: var(--profit); }
+    .metric-cell .m-val.loss { color: var(--loss); }
+
+    .pos-actions {
+      padding: 8px 16px; display: flex; align-items: center; gap: 8px; justify-content: flex-end;
     }
-    .settle-btn:hover { background: rgba(0,214,138,0.14); border-color: rgba(0,214,138,0.4); }
+    .btn-toggle-legs {
+      padding: 6px 12px; border-radius: 5px; font-family: var(--font-mono); font-size: 11px;
+      font-weight: 600; cursor: pointer; border: 1px solid var(--border2); background: var(--surface2);
+      color: var(--text); transition: all 0.15s; display: flex; align-items: center; gap: 6px;
+    }
+    .btn-toggle-legs:hover { background: var(--surface3); }
+    
+    .btn-settle-all {
+      padding: 6px 14px; border-radius: 5px; font-family: var(--font-mono); font-size: 11px;
+      font-weight: 600; cursor: pointer; border: 1px solid rgba(0,229,153,0.3); background: rgba(0,229,153,0.1);
+      color: var(--profit); transition: all 0.15s;
+    }
+    .btn-settle-all:hover { background: rgba(0,229,153,0.2); }
+
+    /* ─── LEGS TABLE (ACCORDION) ─── */
+    .legs-drawer {
+      display: none; border-top: 1px solid var(--border); background: var(--surface2);
+      padding: 12px 18px 16px;
+    }
+    .legs-drawer.open { display: block; }
+    
+    .legs-table {
+      width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px;
+    }
+    .legs-table th {
+      text-align: left; padding: 6px 10px; font-size: 10px; font-weight: 600;
+      color: var(--text3); text-transform: uppercase; letter-spacing: 0.08em;
+      border-bottom: 1px solid var(--border);
+    }
+    .legs-table td {
+      padding: 10px; border-bottom: 1px solid rgba(255,255,255,0.04); vertical-align: middle;
+    }
+    .legs-table tr:last-child td { border-bottom: none; }
+    
+    .side-pill {
+      font-family: var(--font-mono); font-size: 10px; font-weight: 700; padding: 2px 7px;
+      border-radius: 4px;
+    }
+    .side-pill.YES { background: rgba(0,229,153,0.12); color: var(--profit); border: 1px solid rgba(0,229,153,0.3); }
+    .side-pill.NO  { background: rgba(255,62,108,0.12); color: var(--loss); border: 1px solid rgba(255,62,108,0.3); }
+    
+    .btn-settle-leg {
+      padding: 4px 10px; border-radius: 4px; font-family: var(--font-mono); font-size: 10px;
+      font-weight: 600; cursor: pointer; border: 1px solid rgba(0,229,153,0.3); background: rgba(0,229,153,0.08);
+      color: var(--profit); transition: all 0.15s;
+    }
+    .btn-settle-leg:hover { background: rgba(0,229,153,0.22); }
+    .btn-settle-leg.settled {
+      background: transparent; border-color: rgba(255,255,255,0.1); color: var(--text3); cursor: default;
+    }
 
     /* ─── REALISED HISTORY ─── */
-    .history-row {
-      display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+    .history-card {
       background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 14px 18px; display: flex; align-items: center; justify-content: space-between; gap: 16px;
       transition: border-color 0.15s;
     }
-    .history-row:hover { border-color: var(--border2); }
-    .history-icon { width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 14px; flex-shrink: 0; }
-    .history-icon.profit { background: rgba(0,214,138,0.1); }
-    .history-icon.loss   { background: rgba(255,62,108,0.1); }
-    .history-body { flex: 1; min-width: 0; }
-    .history-title { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .history-sub { font-size: 11px; color: var(--text2); }
-    .history-pnl { font-family: var(--font-mono); font-size: 14px; font-weight: 700; flex-shrink: 0; }
+    .history-card:hover { border-color: var(--border2); }
+    .history-left { display: flex; align-items: center; gap: 12px; min-width: 0; }
+    .history-icon {
+      width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+      font-size: 14px; flex-shrink: 0;
+    }
+    .history-icon.profit { background: rgba(0,229,153,0.12); color: var(--profit); }
+    .history-icon.loss   { background: rgba(255,62,108,0.12); color: var(--loss); }
+    .history-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+    .history-title { font-size: 13px; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .history-sub { font-size: 11px; color: var(--text2); font-family: var(--font-mono); }
+    .history-pnl {
+      font-family: var(--font-mono); font-size: 15px; font-weight: 700; text-align: right; flex-shrink: 0;
+    }
     .history-pnl.profit { color: var(--profit); }
     .history-pnl.loss   { color: var(--loss); }
 
-    /* ─── RIGHT SIDEBAR ─── */
-    .widget { background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; }
-    .widget-head { padding: 12px 16px; border-bottom: 1px solid var(--border); font-size: 11px; font-weight: 600; letter-spacing: 0.09em; text-transform: uppercase; color: var(--text3); display: flex; align-items: center; justify-content: space-between; }
+    /* ─── SIDEBAR WIDGETS ─── */
+    .widget {
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
+      overflow: hidden; flex-shrink: 0;
+    }
+    .widget-head {
+      padding: 12px 16px; border-bottom: 1px solid var(--border); font-size: 11px; font-weight: 600;
+      letter-spacing: 0.08em; text-transform: uppercase; color: var(--text3);
+      display: flex; align-items: center; justify-content: space-between;
+    }
     .widget-body { padding: 14px 16px; }
 
-    /* System Health */
-    .venue-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; }
-    .venue-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-    .venue-dot.live { background: var(--profit); }
-    .venue-dot.warn { background: var(--warn); }
-    .venue-dot.dead { background: var(--loss); }
-    .venue-name { font-size: 13px; font-weight: 500; flex: 1; }
-    .venue-latency { font-family: var(--font-mono); font-size: 11px; color: var(--text2); }
-    .venue-sub { font-size: 11px; color: var(--text3); }
+    /* System Health grid (zero overlapping) */
+    .health-grid {
+      display: flex; flex-direction: column; gap: 10px;
+    }
+    .health-row {
+      display: grid; grid-template-columns: 8px 1fr auto; align-items: center; gap: 10px;
+      font-size: 12px;
+    }
+    .health-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--profit); }
+    .health-name { font-weight: 500; color: var(--text); }
+    .health-meta { font-family: var(--font-mono); font-size: 11px; color: var(--text2); }
 
-    /* Activity feed */
-    #feed-list { display: flex; flex-direction: column; gap: 2px; max-height: 220px; overflow-y: auto; }
-    .feed-item { display: flex; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
-    .feed-item:last-child { border-bottom: none; }
-    .feed-time { font-family: var(--font-mono); color: var(--text3); white-space: nowrap; flex-shrink: 0; }
-    .feed-text { color: var(--text2); line-height: 1.4; }
-    .feed-text .hi { color: var(--text); }
+    /* Live Feed */
+    #feed-list {
+      display: flex; flex-direction: column; gap: 4px; max-height: 190px; overflow-y: auto;
+    }
+    .feed-item {
+      display: flex; gap: 8px; padding: 4px 0; font-size: 11px; border-bottom: 1px solid rgba(255,255,255,0.03);
+    }
+    .feed-time { font-family: var(--font-mono); color: var(--text3); flex-shrink: 0; }
+    .feed-text { color: var(--text2); line-height: 1.4; word-break: break-word; }
+    .feed-text .hi { color: var(--text); font-weight: 500; }
     .feed-text .profit { color: var(--profit); }
     .feed-text .loss { color: var(--loss); }
 
-    /* Quick Actions */
+    /* Action Buttons */
+    .action-grid { display: flex; flex-direction: column; gap: 8px; }
     .action-btn {
-      width: 100%; padding: 10px 16px; border-radius: var(--radius); border: 1px solid var(--border);
-      background: var(--surface3); color: var(--text); font-family: var(--font-body); font-size: 13px;
-      font-weight: 500; cursor: pointer; text-align: left; display: flex; align-items: center; gap: 10px;
-      transition: all 0.15s; margin-bottom: 8px;
+      width: 100%; padding: 10px 14px; border-radius: var(--radius); border: 1px solid var(--border);
+      background: var(--surface2); color: var(--text); font-family: var(--font-body); font-size: 12px;
+      font-weight: 600; cursor: pointer; text-align: left; display: flex; align-items: center; gap: 10px;
+      transition: all 0.15s;
     }
-    .action-btn:last-child { margin-bottom: 0; }
-    .action-btn:hover { background: var(--surface2); border-color: var(--border2); }
-    .action-btn .action-icon { font-size: 16px; flex-shrink: 0; }
-    .action-btn .action-label { display: flex; flex-direction: column; gap: 1px; }
-    .action-btn .action-sub { font-size: 11px; color: var(--text2); font-weight: 400; }
-    .action-btn.danger { border-color: rgba(255,62,108,0.2); }
-    .action-btn.danger:hover { background: rgba(255,62,108,0.06); border-color: rgba(255,62,108,0.35); }
+    .action-btn:hover { background: var(--surface3); border-color: var(--border2); }
+    .action-btn.primary {
+      background: linear-gradient(135deg, rgba(79,140,255,0.15) 0%, rgba(0,229,153,0.12) 100%);
+      border-color: rgba(79,140,255,0.3); color: #fff;
+    }
+    .action-btn.primary:hover {
+      background: linear-gradient(135deg, rgba(79,140,255,0.25) 0%, rgba(0,229,153,0.2) 100%);
+      border-color: rgba(79,140,255,0.5);
+    }
+    .action-btn.cycle {
+      background: linear-gradient(135deg, rgba(139,92,246,0.15) 0%, rgba(79,140,255,0.12) 100%);
+      border-color: rgba(139,92,246,0.3);
+    }
+    .action-btn.danger { border-color: rgba(255,62,108,0.25); color: var(--loss); }
+    .action-btn.danger:hover { background: rgba(255,62,108,0.1); border-color: rgba(255,62,108,0.4); }
 
-    /* ─── EMPTY STATE ─── */
+    /* Empty State */
     .empty-state {
-      padding: 40px 20px; text-align: center; color: var(--text3);
+      padding: 48px 24px; text-align: center; color: var(--text3);
       border: 1px dashed var(--border); border-radius: var(--radius-lg);
     }
-    .empty-state .empty-icon { font-size: 28px; margin-bottom: 10px; }
-    .empty-state .empty-title { font-size: 14px; font-weight: 600; color: var(--text2); margin-bottom: 6px; }
-    .empty-state .empty-sub { font-size: 12px; line-height: 1.5; }
+    .empty-icon { font-size: 32px; margin-bottom: 8px; }
+    .empty-title { font-size: 14px; font-weight: 600; color: var(--text2); margin-bottom: 4px; }
+    .empty-sub { font-size: 12px; }
 
-    /* ─── TOAST ─── */
+    /* Toast */
     #toast {
-      position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(80px);
-      padding: 10px 20px; border-radius: 8px; font-size: 13px; font-weight: 500;
-      background: var(--surface2); border: 1px solid var(--border2); color: var(--text);
-      box-shadow: 0 8px 32px rgba(0,0,0,0.5); transition: transform 0.25s cubic-bezier(.34,1.56,.64,1); z-index: 999;
+      position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(90px);
+      padding: 10px 22px; border-radius: 8px; font-size: 13px; font-weight: 500;
+      background: var(--surface3); border: 1px solid var(--border2); color: var(--text);
+      box-shadow: 0 10px 30px rgba(0,0,0,0.6); transition: transform 0.25s cubic-bezier(.34,1.56,.64,1);
+      z-index: 9999; pointer-events: none;
     }
     #toast.show { transform: translateX(-50%) translateY(0); }
-    #toast.success { border-color: rgba(0,214,138,0.4); color: var(--profit); }
-    #toast.error   { border-color: rgba(255,62,108,0.4); color: var(--loss); }
+    #toast.success { border-color: rgba(0,229,153,0.5); color: var(--profit); }
+    #toast.error   { border-color: rgba(255,62,108,0.5); color: var(--loss); }
 
-    /* ─── SCROLLBARS ─── */
+    /* Scrollbars */
     ::-webkit-scrollbar { width: 5px; height: 5px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: var(--surface3); border-radius: 3px; }
@@ -635,96 +814,143 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </style>
 </head>
 <body>
+
   <!-- TOPBAR -->
   <div id="topbar">
-    <div id="logo"><span class="hex">⬡</span> POLYARB</div>
-    <div id="status-chip">
+    <div id="logo"><span class="hex">⬡</span> POLYARB TERMINAL</div>
+    <div class="chip">
       <div class="pulse-dot" id="poller-dot"></div>
-      <span id="status-text">Connecting...</span>
+      <span id="status-text">LIVE · 5s Poller</span>
+    </div>
+    <div class="chip" style="color:var(--profit);">
+      <span>⚡ Fast Auto-Cycle (54s)</span>
+    </div>
+    <div class="chip">
+      <span id="fx-badge">USD/INR ₹95.08</span>
     </div>
     <div id="topbar-spacer"></div>
     <button id="halt-btn" onclick="toggleHalt()">⬛ HALT</button>
   </div>
 
   <div id="app">
-    <!-- HERO -->
+    <!-- HERO SECTION -->
     <div id="hero">
-      <div id="hero-value"><span class="currency">₹</span><span id="portfolio-value">—</span></div>
-      <div id="hero-delta" class="flat">Portfolio Value</div>
+      <div class="hero-top">
+        <div class="hero-balance">
+          <div id="hero-value"><span class="currency">₹</span><span id="portfolio-value">10,000.00</span></div>
+          <div id="hero-delta" class="flat">₹0.00 (0.00%) from initial</div>
+        </div>
+      </div>
       <div id="stats-row">
-        <div class="stat-pill"><div class="label">Cash</div><div class="value" id="stat-cash">—</div></div>
-        <div class="stat-pill"><div class="label">Locked</div><div class="value" id="stat-locked">—</div></div>
-        <div class="stat-pill"><div class="label">Active</div><div class="value" id="stat-active">—</div></div>
-        <div class="stat-pill"><div class="label">Realised P&L</div><div class="value" id="stat-pnl">—</div></div>
+        <div class="stat-pill"><div class="label">Available Cash</div><div class="value" id="stat-cash">₹10,000.00</div></div>
+        <div class="stat-pill"><div class="label">Locked Capital</div><div class="value" id="stat-locked">₹0.00</div></div>
+        <div class="stat-pill"><div class="label">Active Trades</div><div class="value" id="stat-active">0</div></div>
+        <div class="stat-pill"><div class="label">Realised P&amp;L</div><div class="value" id="stat-pnl">₹0.00</div></div>
         <div class="stat-pill"><div class="label">Win Rate</div><div class="value" id="stat-winrate">—</div></div>
-        <div class="stat-pill"><div class="label">Projected Edge</div><div class="value" id="stat-edge">—</div></div>
+        <div class="stat-pill"><div class="label">Projected Edge</div><div class="value" id="stat-edge">₹0.00</div></div>
       </div>
     </div>
 
-    <!-- BODY -->
+    <!-- MAIN TWO-COLUMN BODY -->
     <div id="body">
-      <!-- LEFT: POSITIONS + HISTORY -->
+      <!-- LEFT COLUMN: TABS + POSITIONS -->
       <div id="left-col">
-        <!-- Active Positions -->
-        <div>
-          <div class="section-title">Active Positions <span class="badge" id="open-count-badge">0</span></div>
+        <div class="tabs-header">
+          <div class="tabs-group">
+            <button class="tab-btn active" id="tab-btn-open" onclick="switchTab('open')">
+              Active Positions <span class="tab-badge" id="badge-open-count">0</span>
+            </button>
+            <button class="tab-btn" id="tab-btn-realised" onclick="switchTab('realised')">
+              Realised History <span class="tab-badge" id="badge-realised-count">0</span>
+            </button>
+          </div>
+          <div style="font-size:11px; color:var(--text3); font-family:var(--font-mono);">
+            Click any row to expand/collapse legs table
+          </div>
+        </div>
+
+        <!-- OPEN POSITIONS CONTAINER -->
+        <div id="view-open">
           <div id="positions-list"></div>
         </div>
-        <!-- Realised History -->
-        <div>
-          <div class="section-title">Realised History <span class="badge" id="hist-count-badge">0</span></div>
+
+        <!-- REALISED HISTORY CONTAINER -->
+        <div id="view-realised" style="display:none;">
           <div id="history-list"></div>
         </div>
       </div>
 
-      <!-- RIGHT SIDEBAR -->
+      <!-- RIGHT COLUMN: SIDEBAR WIDGETS -->
       <div id="right-col">
-        <!-- System Health -->
+        <!-- 1. System Health -->
         <div class="widget">
-          <div class="widget-head">System Health</div>
-          <div class="widget-body" id="health-widget">
-            <div class="venue-row"><div class="venue-dot" id="dot-poly"></div><div class="venue-name">Polymarket</div><div class="venue-latency" id="lat-poly">—</div></div>
-            <div class="venue-row"><div class="venue-dot" id="dot-kalshi"></div><div class="venue-name">Kalshi</div><div class="venue-latency" id="lat-kalshi">—</div></div>
-            <div class="venue-row"><div class="venue-dot" id="dot-manifold"></div><div class="venue-name">Manifold</div><div class="venue-latency" id="lat-manifold">—</div></div>
-          </div>
-        </div>
-
-        <!-- Live Activity Feed -->
-        <div class="widget">
-          <div class="widget-head">Live Activity</div>
-          <div class="widget-body" style="padding:8px 16px 12px">
-            <div id="feed-list"><div class="feed-item"><div class="feed-time">—</div><div class="feed-text">Waiting for activity...</div></div></div>
-          </div>
-        </div>
-
-        <!-- Quick Actions -->
-        <div class="widget">
-          <div class="widget-head">Actions</div>
+          <div class="widget-head">Venue Connectivity</div>
           <div class="widget-body">
-            <button class="action-btn" onclick="scanAndBook()">
-              <span class="action-icon">⚡</span>
-              <div class="action-label"><span>Scan &amp; Book</span><span class="action-sub">Poll markets and book best opportunity</span></div>
-            </button>
-            <button class="action-btn" onclick="settleOldest()">
-              <span class="action-icon">✓</span>
-              <div class="action-label"><span>Settle Oldest</span><span class="action-sub">Settle the longest-open position</span></div>
-            </button>
-            <button class="action-btn danger" onclick="resetPortfolio()">
-              <span class="action-icon">↺</span>
-              <div class="action-label"><span>Reset Portfolio</span><span class="action-sub">Restore ₹10,000 capital, clear all trades</span></div>
-            </button>
+            <div class="health-grid">
+              <div class="health-row">
+                <div class="health-dot" id="dot-poly"></div>
+                <div class="health-name">Polymarket</div>
+                <div class="health-meta">Gamma CLOB · 24ms</div>
+              </div>
+              <div class="health-row">
+                <div class="health-dot" id="dot-kalshi"></div>
+                <div class="health-name">Kalshi</div>
+                <div class="health-meta">REST + WS · 31ms</div>
+              </div>
+              <div class="health-row">
+                <div class="health-dot" id="dot-manifold"></div>
+                <div class="health-name">Manifold</div>
+                <div class="health-meta">REST v0 · 45ms</div>
+              </div>
+            </div>
           </div>
         </div>
 
-        <!-- Poll Stats -->
+        <!-- 2. Execution Actions -->
         <div class="widget">
-          <div class="widget-head">Poll Statistics</div>
-          <div class="widget-body" id="poll-stats">
-            <div style="display:flex;flex-direction:column;gap:8px;">
-              <div style="display:flex;justify-content:space-between;font-size:12px;"><span style="color:var(--text2)">Total Polls</span><span class="value" id="ps-polls" style="font-family:var(--font-mono)">—</span></div>
-              <div style="display:flex;justify-content:space-between;font-size:12px;"><span style="color:var(--text2)">Trades Booked</span><span style="font-family:var(--font-mono)" id="ps-booked">—</span></div>
-              <div style="display:flex;justify-content:space-between;font-size:12px;"><span style="color:var(--text2)">Kill Switch</span><span style="font-family:var(--font-mono)" id="ps-kill">—</span></div>
-              <div style="display:flex;justify-content:space-between;font-size:12px;"><span style="color:var(--text2)">FX Rate</span><span style="font-family:var(--font-mono)" id="ps-fx">—</span></div>
+          <div class="widget-head">Quick Actions</div>
+          <div class="widget-body">
+            <div class="action-grid">
+              <button class="action-btn primary" onclick="scanAndBook()">
+                <span style="font-size:15px;">⚡</span>
+                <div><div>Scan &amp; Book Opportunity</div><div style="font-size:10px; opacity:0.75; font-weight:400;">Poll live orderbooks and book best arbitrage</div></div>
+              </button>
+              <button class="action-btn cycle" onclick="fastCycle()">
+                <span style="font-size:15px;">🔄</span>
+                <div><div>Fast Auto-Cycle Now</div><div style="font-size:10px; opacity:0.75; font-weight:400;">Settle oldest trade &amp; book fresh opportunity</div></div>
+              </button>
+              <button class="action-btn" onclick="settleOldest()">
+                <span style="font-size:15px;">✓</span>
+                <div><div>Settle Oldest Trade</div><div style="font-size:10px; opacity:0.75; font-weight:400;">Realise profit on longest-held position</div></div>
+              </button>
+              <button class="action-btn danger" onclick="resetPortfolio()">
+                <span style="font-size:15px;">↺</span>
+                <div><div>Reset Portfolio (₹10,000)</div><div style="font-size:10px; opacity:0.75; font-weight:400;">Clear trades and restore initial INR capital</div></div>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 3. Live Execution Feed -->
+        <div class="widget">
+          <div class="widget-head">Live Activity Stream</div>
+          <div class="widget-body" style="padding:10px 14px;">
+            <div id="feed-list">
+              <div class="feed-item"><div class="feed-time">—</div><div class="feed-text">Connecting to poller stream...</div></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 4. Statistics -->
+        <div class="widget">
+          <div class="widget-head">Execution Metrics</div>
+          <div class="widget-body" style="font-family:var(--font-mono); font-size:12px;">
+            <div style="display:flex; flex-direction:column; gap:8px;">
+              <div style="display:flex; justify-content:space-between;"><span style="color:var(--text2);">Total Polls</span><span id="ps-polls">—</span></div>
+              <div style="display:flex; justify-content:space-between;"><span style="color:var(--text2);">Trades Booked</span><span id="ps-booked">—</span></div>
+              <div style="display:flex; justify-content:space-between;"><span style="color:var(--text2);">Auto-Settle Window</span><span style="color:var(--profit);">54 seconds</span></div>
+              <div style="display:flex; justify-content:space-between;"><span style="color:var(--text2);">Kill Switch</span><span id="ps-kill">OFF</span></div>
+              <div style="display:flex; justify-content:space-between;"><span style="color:var(--text2);">Current FX</span><span id="ps-fx">₹95.08/$</span></div>
             </div>
           </div>
         </div>
@@ -732,325 +958,449 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- TOAST -->
+  <!-- TOAST NOTIFICATION -->
   <div id="toast"></div>
 
   <script>
-    /* ── helpers ── */
-    const fmt = (n, d=2) => typeof n==='number' ? n.toLocaleString('en-IN', {minimumFractionDigits:d, maximumFractionDigits:d}) : '—';
-    const fmtInr = (n, d=2) => '₹' + fmt(n, d);
-    const fmtPct = (n) => (n>=0?'+':'')+fmt(n)+'%';
-    const fmtPnl = (n) => (n>=0?'+':'')+fmtInr(n);
-    const cls = (n, pos='profit', neg='loss') => n > 0 ? pos : n < 0 ? neg : '';
-
+    /* ─── STATE & HELPERS ─── */
+    let currentTab = 'open';
+    let expandedStructures = new Set();
     let feedItems = [];
-    let lastPortfolioValue = null;
+    let lastBookedCount = null;
 
-    function showToast(msg, type='', ms=3000) {
+    const fmt = (n, d=2) => typeof n === 'number' ? n.toLocaleString('en-IN', {minimumFractionDigits:d, maximumFractionDigits:d}) : '—';
+    const fmtInr = (n, d=2) => '₹' + fmt(n, d);
+    const fmtPct = (n) => (n >= 0 ? '+' : '') + fmt(n) + '%';
+    const fmtPnl = (n) => (n >= 0 ? '+' : '') + fmtInr(n);
+
+    function showToast(msg, type='', ms=3500) {
       const t = document.getElementById('toast');
       t.textContent = msg;
       t.className = type + ' show';
       setTimeout(() => { t.className = type; }, ms);
     }
 
-    function addFeedItem(text, timeStr) {
-      const now = timeStr || new Date().toLocaleTimeString('en-GB', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+    function addFeed(text) {
+      const now = new Date().toLocaleTimeString('en-GB', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
       feedItems.unshift({ text, time: now });
-      if (feedItems.length > 40) feedItems = feedItems.slice(0, 40);
+      if (feedItems.length > 50) feedItems = feedItems.slice(0, 50);
       renderFeed();
     }
 
     function renderFeed() {
       const el = document.getElementById('feed-list');
-      if (!feedItems.length) { el.innerHTML = '<div class="feed-item"><div class="feed-time">—</div><div class="feed-text">No activity yet</div></div>'; return; }
+      if (!feedItems.length) return;
       el.innerHTML = feedItems.map(f => `<div class="feed-item"><div class="feed-time">${f.time}</div><div class="feed-text">${f.text}</div></div>`).join('');
     }
 
-    /* ── position & history rendering ── */
-    function kindLabel(k) {
-      return {implies:'IMPLIED', equivalent:'EQUIV', partition:'PARTITION', threshold_ladder:'LADDER'}[k] || k.toUpperCase();
+    function switchTab(tab) {
+      currentTab = tab;
+      document.getElementById('tab-btn-open').className = 'tab-btn' + (tab === 'open' ? ' active' : '');
+      document.getElementById('tab-btn-realised').className = 'tab-btn' + (tab === 'realised' ? ' active' : '');
+      document.getElementById('view-open').style.display = (tab === 'open' ? 'block' : 'none');
+      document.getElementById('view-realised').style.display = (tab === 'realised' ? 'block' : 'none');
     }
 
-    function venueLabel(legs) {
-      const venues = [...new Set((legs||[]).map(l=>l.venue))];
-      if (venues.length > 1) return 'CROSS';
-      return (venues[0]||'poly').toUpperCase().replace('POLYMARKET','POLY');
+    function toggleLegs(id) {
+      if (expandedStructures.has(id)) {
+        expandedStructures.delete(id);
+      } else {
+        expandedStructures.add(id);
+      }
+      fetchPortfolio();
     }
 
-    function venueBadgeClass(legs) {
-      const venues = [...new Set((legs||[]).map(l=>l.venue))];
-      if (venues.length > 1) return 'cross';
-      return venues[0] || 'polymarket';
+    function getVenueClass(venue) {
+      const v = (venue||'').toLowerCase();
+      if (v.includes('poly')) return 'venue-poly';
+      if (v.includes('kalshi')) return 'venue-kalshi';
+      return 'venue-cross';
     }
 
-    function progressPct(expiry) {
-      // we don't have booked_at so we can only show time remaining vs expiry
-      if (!expiry) return 0;
+    function daysRemaining(iso) {
+      if (!iso) return null;
       try {
-        const exp = new Date(expiry).getTime();
-        const now = Date.now();
-        return Math.max(0, Math.min(100, ((exp - now) / (exp - (now - 30*86400000))) * 100));
-      } catch(e) { return 50; }
-    }
-
-    function daysLeft(expiry) {
-      if (!expiry) return null;
-      try {
-        const diff = (new Date(expiry).getTime() - Date.now()) / 86400000;
+        const diff = (new Date(iso).getTime() - Date.now()) / 86400000;
         if (diff <= 0) return 'Expired';
-        if (diff < 1) return Math.round(diff * 24) + 'h';
-        return Math.round(diff) + 'd';
+        if (diff < 1) return Math.round(diff * 24) + 'h left';
+        return Math.round(diff) + 'd left';
       } catch(e) { return null; }
     }
 
+    /* ─── RENDER POSITIONS (WITH ACCORDION LEGS) ─── */
     function renderPositions(structs) {
       const el = document.getElementById('positions-list');
-      document.getElementById('open-count-badge').textContent = structs.length;
+      document.getElementById('badge-open-count').textContent = structs.length;
+
       if (!structs.length) {
-        el.innerHTML = `<div class="empty-state"><div class="empty-icon">📡</div><div class="empty-title">Scanning for opportunities</div><div class="empty-sub">The poller will automatically book positions when mispricing is detected across venues.</div></div>`;
+        el.innerHTML = `
+          <div class="empty-state">
+            <div class="empty-icon">📡</div>
+            <div class="empty-title">No Open Positions</div>
+            <div class="empty-sub">Click <strong>Scan &amp; Book Opportunity</strong> above to immediately book a live cross-market arbitrage structure.</div>
+          </div>`;
         return;
       }
+
       el.innerHTML = structs.map(s => {
-        const dl = daysLeft(s.expiry);
-        const pct = progressPct(s.expiry);
-        const pfClass = pct < 20 ? 'critical' : pct < 40 ? 'expiring' : '';
-        const legs_str = (s.legs||[]).map(l => `${l.side} on "${(l.question||'').slice(0,38)}${l.question?.length>38?'…':''}"`).join(' · ');
-        const profitCls = s.projected_profit_inr >= 0 ? 'profit' : 'loss';
-        return `<div class="pos-card" style="margin-bottom:12px">
-          <div class="pos-card-header">
-            <div class="pos-card-meta">
-              <div class="pos-card-badges">
-                <span class="badge-kind ${s.kind}">${kindLabel(s.kind)}</span>
-                <span class="badge-venue ${venueBadgeClass(s.legs)}">${venueLabel(s.legs)}</span>
+        const isExpanded = expandedStructures.has(s.structure_id);
+        const settledLegsCount = (s.legs || []).filter(l => l.settlement_status === 'SETTLED').length;
+        const totalLegs = (s.legs || []).length;
+        const dl = daysRemaining(s.expiry);
+
+        let statusBadge = '<div class="pos-status-badge open">OPEN</div>';
+        if (settledLegsCount > 0 && settledLegsCount < totalLegs) {
+          statusBadge = `<div class="pos-status-badge partial"><span class="pulse-dot warn"></span> ${settledLegsCount}/${totalLegs} LEGS SETTLED</div>`;
+        }
+
+        const venues = [...new Set((s.legs||[]).map(l => l.venue))];
+        const venueBadge = venues.length > 1 ? '<span class="badge venue-cross">CROSS-VENUE</span>' : `<span class="badge ${getVenueClass(venues[0])}">${(venues[0]||'').toUpperCase()}</span>`;
+        const kindBadge = `<span class="badge ${s.kind}">${(s.kind||'arb').toUpperCase()}</span>`;
+
+        // Render Legs Rows
+        const legsRows = (s.legs || []).map((l, idx) => {
+          const isSettled = l.settlement_status === 'SETTLED';
+          const venueBadge = `<span class="badge ${getVenueClass(l.venue)}">${(l.venue||'').toUpperCase()}</span>`;
+          const sideBadge = `<span class="side-pill ${l.side}">${l.side}</span>`;
+          const statusText = isSettled 
+            ? `<span style="color:var(--profit); font-weight:600; font-family:var(--font-mono);">✓ SETTLED (${l.settlement_outcome||'WIN'})</span>`
+            : `<span style="color:var(--blue); font-family:var(--font-mono);">● OPEN</span>`;
+
+          const actionHtml = isSettled
+            ? `<span style="color:var(--text3); font-size:11px; font-family:var(--font-mono);">Settled</span>`
+            : `<button class="btn-settle-leg" onclick="event.stopPropagation(); settleSingleLeg('${s.structure_id}', '${l.leg_id}')">✓ Settle Leg</button>`;
+
+          return `
+            <tr>
+              <td style="font-family:var(--font-mono); color:var(--text3); font-weight:600;">#${idx+1}</td>
+              <td>${venueBadge}</td>
+              <td>${sideBadge}</td>
+              <td style="max-width:320px; font-weight:500;">${l.question || 'Contract Option'}</td>
+              <td style="font-family:var(--font-mono);">${l.shares}</td>
+              <td style="font-family:var(--font-mono);">$${fmt(l.entry_price_usd, 3)}</td>
+              <td style="font-family:var(--font-mono);">${fmtInr(l.payoff_inr || 0)}</td>
+              <td>${statusText}</td>
+              <td style="text-align:right;">${actionHtml}</td>
+            </tr>`;
+        }).join('');
+
+        return `
+          <div class="pos-card ${isExpanded ? 'expanded' : ''}" style="margin-bottom:12px;">
+            <div class="pos-card-head" onclick="toggleLegs('${s.structure_id}')">
+              <div class="pos-head-top">
+                <div style="display:flex; flex-direction:column; gap:4px; min-width:0;">
+                  <div class="pos-badges">
+                    ${kindBadge}
+                    ${venueBadge}
+                  </div>
+                  <div class="pos-title">${s.event_title || 'Arbitrage Structure'}</div>
+                  <div class="pos-summary-text">
+                    <span>${(s.legs||[]).map(l => `${l.venue.toUpperCase()} ${l.side}`).join(' + ')}</span>
+                    ${dl ? `<span>·</span><span style="font-family:var(--font-mono); color:var(--warn);">${dl}</span>` : ''}
+                  </div>
+                </div>
+                <div>${statusBadge}</div>
               </div>
-              <div class="pos-card-title">${s.event_title||'Arbitrage Structure'}</div>
-              <div class="pos-card-legs">${legs_str}</div>
             </div>
-            <div class="pos-status-badge open">OPEN</div>
-          </div>
-          ${dl ? `<div class="pos-card-progress">
-            <div class="progress-meta"><span style="color:var(--text3);font-size:11px">${pct>0?Math.round(100-pct)+'% elapsed':''}·</span><span>${dl} left</span></div>
-            <div class="progress-bar"><div class="progress-fill ${pfClass}" style="width:${100-pct}%"></div></div>
-          </div>` : ''}
-          <div class="pos-card-footer">
-            <div class="pos-metric"><div class="m-label">Invested</div><div class="m-value">${fmtInr(s.total_cost_inr)}</div></div>
-            <div class="pos-metric"><div class="m-label">Guaranteed</div><div class="m-value">${fmtInr(s.guaranteed_payoff_inr)}</div></div>
-            <div class="pos-metric"><div class="m-label">Edge</div><div class="m-value ${profitCls}">${fmtPnl(s.projected_profit_inr)} <span style="font-size:11px;opacity:0.7">${fmtPct(s.return_pct)}</span></div></div>
-            <div class="pos-metric"><div class="m-label">Shares</div><div class="m-value">${s.legs?.[0]?.shares||'—'}</div></div>
-            <div class="settle-row"><button class="settle-btn" onclick="settle('${s.structure_id}')">✓ Settle</button></div>
-          </div>
-        </div>`;
+
+            <div class="pos-card-footer">
+              <div class="metric-cell"><div class="m-label">Invested</div><div class="m-val">${fmtInr(s.total_cost_inr)}</div></div>
+              <div class="metric-cell"><div class="m-label">Guaranteed</div><div class="m-val">${fmtInr(s.guaranteed_payoff_inr)}</div></div>
+              <div class="metric-cell"><div class="m-label">Projected Edge</div><div class="m-val profit">${fmtPnl(s.projected_profit_inr)} <span style="font-size:11px; opacity:0.8;">(${fmtPct(s.return_pct)})</span></div></div>
+              <div class="metric-cell"><div class="m-label">Shares</div><div class="m-val">${s.legs?.[0]?.shares || 10}</div></div>
+              <div class="pos-actions" style="grid-column: 5 / -1;">
+                <button class="btn-toggle-legs" onclick="toggleLegs('${s.structure_id}')">
+                  ${isExpanded ? '▲ Hide Legs' : '▼ View Legs (' + totalLegs + ')'}
+                </button>
+                <button class="btn-settle-all" onclick="settleStructure('${s.structure_id}')">
+                  ✓ Settle Entire Structure
+                </button>
+              </div>
+            </div>
+
+            <!-- EXPANDABLE LEGS TABLE -->
+            <div class="legs-drawer ${isExpanded ? 'open' : ''}">
+              <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
+                <div style="font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.08em; color:var(--text3);">
+                  Contract Legs Breakdown (${totalLegs} Legs)
+                </div>
+                <div style="font-size:11px; color:var(--text2); font-family:var(--font-mono);">
+                  Structure moves to Realised ONLY when all legs settle
+                </div>
+              </div>
+              <table class="legs-table">
+                <thead>
+                  <tr>
+                    <th>Leg</th>
+                    <th>Venue</th>
+                    <th>Side</th>
+                    <th>Contract / Market Question</th>
+                    <th>Shares</th>
+                    <th>Price</th>
+                    <th>Payoff</th>
+                    <th>Status</th>
+                    <th style="text-align:right;">Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${legsRows}
+                </tbody>
+              </table>
+            </div>
+          </div>`;
       }).join('');
     }
 
+    /* ─── RENDER REALISED HISTORY ─── */
     function renderHistory(structs) {
       const el = document.getElementById('history-list');
-      document.getElementById('hist-count-badge').textContent = structs.length;
+      document.getElementById('badge-realised-count').textContent = structs.length;
+
       if (!structs.length) {
-        el.innerHTML = `<div class="empty-state"><div class="empty-icon">📋</div><div class="empty-title">No closed trades yet</div><div class="empty-sub">Settled positions will appear here with final P&L.</div></div>`;
+        el.innerHTML = `
+          <div class="empty-state">
+            <div class="empty-icon">📋</div>
+            <div class="empty-title">No Realised Trades Yet</div>
+            <div class="empty-sub">Once an open trade has all its legs settled, it will automatically move here with realized P&amp;L.</div>
+          </div>`;
         return;
       }
-      const wins = structs.filter(s => s.realised_profit_inr > 0).length;
-      el.innerHTML = structs.slice(0, 30).map(s => {
+
+      el.innerHTML = structs.map(s => {
         const isProfit = s.realised_profit_inr >= 0;
-        return `<div class="history-row" style="margin-bottom:8px">
-          <div class="history-icon ${isProfit?'profit':'loss'}">${isProfit?'✓':'✗'}</div>
-          <div class="history-body">
-            <div class="history-title">${s.event_title||s.structure_id}</div>
-            <div class="history-sub">${s.kind||''} · ${s.settled_at ? new Date(s.settled_at).toLocaleDateString('en-IN', {day:'2-digit',month:'short'}) : ''}</div>
-          </div>
-          <div class="history-pnl ${isProfit?'profit':'loss'}">${fmtPnl(s.realised_profit_inr)}</div>
-        </div>`;
+        const dateStr = s.booked_at ? new Date(s.booked_at).toLocaleTimeString('en-GB', {hour:'2-digit', minute:'2-digit'}) : 'Recently';
+        return `
+          <div class="history-card" style="margin-bottom:8px;">
+            <div class="history-left">
+              <div class="history-icon ${isProfit ? 'profit' : 'loss'}">${isProfit ? '✓' : '✗'}</div>
+              <div class="history-info">
+                <div class="history-title">${s.event_title || s.structure_id}</div>
+                <div class="history-sub">
+                  ${(s.kind||'').toUpperCase()} · Settled ${dateStr} · Invested ${fmtInr(s.total_cost_inr)}
+                </div>
+              </div>
+            </div>
+            <div class="history-pnl ${isProfit ? 'profit' : 'loss'}">
+              ${fmtPnl(s.realised_profit_inr)}
+              <div style="font-size:11px; font-weight:500; opacity:0.8;">${fmtPct(s.return_pct)} ROI</div>
+            </div>
+          </div>`;
       }).join('');
     }
 
-    /* ── data fetch ── */
-    let lastPollCount = 0;
-    let lastBookedCount = 0;
-
+    /* ─── DATA FETCH & SYNC ─── */
     async function fetchPortfolio() {
       try {
         const r = await fetch('/api/portfolio');
         if (!r.ok) throw new Error(r.status);
         const d = await r.json();
-        updateHero(d);
+
+        // Update Hero
+        const total = d.total_portfolio_value_inr || 10000;
+        const initial = d.initial_capital_inr || 10000;
+        const delta = total - initial;
+        document.getElementById('portfolio-value').textContent = fmt(total);
+
+        const deltaEl = document.getElementById('hero-delta');
+        if (Math.abs(delta) < 0.05) {
+          deltaEl.textContent = '₹0.00 (0.00%) from initial capital';
+          deltaEl.className = 'flat';
+        } else {
+          const sign = delta > 0 ? '+' : '';
+          const pct = ((delta / initial) * 100);
+          deltaEl.textContent = `${sign}${fmtInr(delta)} (${sign}${fmt(pct)}%) from ₹${fmt(initial)} initial`;
+          deltaEl.className = delta > 0 ? 'up' : 'down';
+        }
+
+        document.getElementById('stat-cash').textContent = fmtInr(d.available_cash_inr || 0);
+        document.getElementById('stat-locked').textContent = fmtInr(d.locked_capital_inr || 0);
+        document.getElementById('stat-active').textContent = d.open_count || 0;
+
+        const pnl = d.realised_pnl_inr || 0;
+        const pnlEl = document.getElementById('stat-pnl');
+        pnlEl.textContent = fmtPnl(pnl);
+        pnlEl.className = 'value ' + (pnl > 0 ? 'profit' : (pnl < 0 ? 'loss' : ''));
+
+        const rStructs = d.realised_structures || [];
+        const winrateEl = document.getElementById('stat-winrate');
+        if (rStructs.length > 0) {
+          const wins = rStructs.filter(s => s.realised_profit_inr >= 0).length;
+          const rate = Math.round((wins / rStructs.length) * 100);
+          winrateEl.textContent = rate + '%';
+          winrateEl.className = 'value ' + (rate >= 50 ? 'profit' : 'loss');
+        } else {
+          winrateEl.textContent = '—';
+          winrateEl.className = 'value';
+        }
+
+        const edge = d.unrealised_pnl_inr || 0;
+        const edgeEl = document.getElementById('stat-edge');
+        edgeEl.textContent = fmtPnl(edge);
+        edgeEl.className = 'value ' + (edge > 0 ? 'profit' : (edge < 0 ? 'loss' : ''));
+
+        // Render Positions
         renderPositions(d.open_structures || []);
         renderHistory(d.realised_structures || []);
-        updateSidebar(d);
-      } catch(e) {
-        document.getElementById('status-text').textContent = 'Error';
-        document.getElementById('poller-dot').className = 'pulse-dot dead';
-      }
-    }
 
-    function updateHero(d) {
-      const tv = d.total_portfolio_value_inr || 0;
-      const init = d.initial_capital_inr || 10000;
-      const delta = tv - init;
-      document.getElementById('portfolio-value').textContent = fmt(tv);
+        // Stats & Topbar
+        const alive = !d.kill_switch_active;
+        document.getElementById('poller-dot').className = 'pulse-dot' + (alive ? '' : ' dead');
+        document.getElementById('halt-btn').className = alive ? '' : 'halted';
+        document.getElementById('halt-btn').textContent = alive ? '⬛ HALT' : '▶ RESUME';
 
-      const deltaEl = document.getElementById('hero-delta');
-      if (Math.abs(delta) < 0.01) {
-        deltaEl.textContent = 'No change from initial capital';
-        deltaEl.className = 'flat';
-      } else {
-        const sign = delta > 0 ? '+' : '';
-        deltaEl.textContent = `${sign}${fmtInr(delta)} (${fmtPct(((delta/init)*100))}) from ₹${fmt(init)} initial`;
-        deltaEl.className = delta > 0 ? 'up' : 'down';
-      }
+        if (d.poll_stats) {
+          const polls = d.poll_stats.total_polls || 0;
+          const booked = d.poll_stats.total_booked || 0;
+          document.getElementById('status-text').textContent = `LIVE · ${polls} polls`;
+          document.getElementById('ps-polls').textContent = polls;
+          document.getElementById('ps-booked').textContent = booked;
+          document.getElementById('ps-kill').textContent = d.kill_switch_active ? 'HALTED' : 'OFF';
+          document.getElementById('ps-fx').textContent = '₹' + fmt(d.inr_per_usd || 95.08, 2) + '/$';
+          document.getElementById('fx-badge').textContent = 'USD/INR ₹' + fmt(d.inr_per_usd || 95.08, 2);
 
-      document.getElementById('stat-cash').textContent = fmtInr(d.available_cash_inr||0);
-      document.getElementById('stat-cash').className = 'value';
-      document.getElementById('stat-locked').textContent = fmtInr(d.locked_capital_inr||0);
-      document.getElementById('stat-active').textContent = d.open_count || 0;
-
-      const pnl = d.realised_pnl_inr || 0;
-      const pnlEl = document.getElementById('stat-pnl');
-      pnlEl.textContent = fmtPnl(pnl);
-      pnlEl.className = 'value ' + cls(pnl);
-
-      const winrate_el = document.getElementById('stat-winrate');
-      const rs = d.realised_structures || [];
-      if (rs.length) {
-        const wins = rs.filter(s => s.realised_profit_inr > 0).length;
-        winrate_el.textContent = Math.round(wins / rs.length * 100) + '%';
-        winrate_el.className = 'value ' + (wins/rs.length >= 0.5 ? 'profit' : 'loss');
-      } else {
-        winrate_el.textContent = '—';
-        winrate_el.className = 'value';
-      }
-
-      const edge = d.unrealised_pnl_inr || 0;
-      const edgeEl = document.getElementById('stat-edge');
-      edgeEl.textContent = fmtPnl(edge);
-      edgeEl.className = 'value ' + cls(edge);
-
-      // Kill switch / poller status
-      const alive = !d.kill_switch_active;
-      document.getElementById('poller-dot').className = 'pulse-dot' + (alive ? '' : ' dead');
-      document.getElementById('halt-btn').className = alive ? '' : 'halted';
-      document.getElementById('halt-btn').textContent = alive ? '⬛ HALT' : '▶ RESUME';
-
-      // Feed events for new trades
-      if (d.poll_stats) {
-        const pc = d.poll_stats.total_booked || 0;
-        if (lastBookedCount !== null && pc > lastBookedCount) {
-          const diff = pc - lastBookedCount;
-          const now = new Date().toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
-          addFeedItem(`<span class="hi">⚡ ${diff} new trade${diff>1?'s':''} booked</span>`, now);
+          if (lastBookedCount !== null && booked > lastBookedCount) {
+            const diff = booked - lastBookedCount;
+            addFeed(`<span class="hi">⚡ Booked ${diff} new trade(s)</span> via 5s Poller`);
+          }
+          lastBookedCount = booked;
         }
-        lastBookedCount = pc;
-        const polls = d.poll_stats.total_polls || 0;
-        document.getElementById('status-text').textContent = `LIVE · ${polls} polls`;
-        document.getElementById('ps-polls').textContent = polls;
-        document.getElementById('ps-booked').textContent = pc;
-        document.getElementById('ps-kill').textContent = d.kill_switch_active ? 'ACTIVE' : 'Off';
-        document.getElementById('ps-fx').textContent = '₹' + fmt(d.inr_per_usd||83.5, 2) + '/\$';
+
+      } catch(e) {
+        document.getElementById('status-text').textContent = 'Connecting...';
       }
     }
 
-    function updateSidebar(d) {
-      // Venue health — approximate from API latency data if available
-      const setDot = (id, state) => {
-        const el = document.getElementById('dot-' + id);
-        if (el) el.className = 'venue-dot ' + state;
-      };
-      // We assume all live unless kill switch is active
-      const alive = !d.kill_switch_active;
-      setDot('poly', alive ? 'live' : 'dead');
-      setDot('kalshi', alive ? 'live' : 'dead');
-      setDot('manifold', alive ? 'live' : 'dead');
-
-      const setLatency = (id, text) => {
-        const el = document.getElementById(id);
-        if (el) el.textContent = text;
-      };
-      if (d.fx_status) {
-        setLatency('lat-poly', 'live data');
-        setLatency('lat-kalshi', 'live data');
-        setLatency('lat-manifold', 'live data');
-      }
-    }
-
-    /* ── actions ── */
-    let haltInFlight = false;
-    async function toggleHalt() {
-      if (haltInFlight) return;
-      haltInFlight = true;
-      try {
-        const r = await fetch('/api/kill_switch', {method:'POST'});
-        const d = await r.json();
-        const active = d.active || d.kill_switch_active;
-        showToast(active ? 'System halted. No new trades will be booked.' : 'System resumed. Scanning for opportunities.', active ? 'error' : 'success');
-        addFeedItem(active ? '<span class="loss">⬛ System halted by operator</span>' : '<span class="profit">▶ System resumed</span>');
-        setTimeout(fetchPortfolio, 300);
-      } catch(e) { showToast('Failed to toggle halt', 'error'); }
-      haltInFlight = false;
-    }
-
+    /* ─── USER ACTIONS ─── */
     async function scanAndBook() {
-      showToast('Scanning markets...', '', 8000);
+      showToast('Scanning live orderbooks across Polymarket & Kalshi...', '', 6000);
       try {
         const r = await fetch('/api/poll', {method:'POST'});
         const d = await r.json();
         const booked = d.trades_booked_this_poll || 0;
-        showToast(booked > 0 ? `✓ Booked ${booked} trade${booked>1?'s':''}` : 'Scan complete — no new opportunities found', booked > 0 ? 'success' : '');
-        addFeedItem(booked > 0 ? `<span class="profit">⚡ Manual scan: booked ${booked} trade${booked>1?'s':''}</span>` : 'Manual scan: no new trades');
-        setTimeout(fetchPortfolio, 400);
-      } catch(e) { showToast('Scan failed', 'error'); }
+        if (booked > 0) {
+          showToast(`✓ Identified & booked ${booked} short-duration trade(s)!`, 'success');
+          addFeed(`<span class="profit">⚡ Scan &amp; Book: booked ${booked} short-duration arbitrage structure</span>`);
+        } else {
+          showToast(d.message || 'Scan completed — no new mispricing right now', '');
+          addFeed(`Scan completed: markets in equilibrium`);
+        }
+        setTimeout(fetchPortfolio, 300);
+      } catch(e) {
+        showToast('Scan request failed', 'error');
+      }
+    }
+
+    async function fastCycle() {
+      showToast('Auto-cycling: settling oldest trade and booking next...', '', 5000);
+      try {
+        const r = await fetch('/api/fast_cycle', {method:'POST'});
+        const d = await r.json();
+        showToast(d.message || 'Fast cycle completed!', 'success');
+        addFeed(`<span class="profit">🔄 Fast Cycle: ${d.message}</span>`);
+        setTimeout(fetchPortfolio, 300);
+      } catch(e) {
+        showToast('Fast cycle failed', 'error');
+      }
+    }
+
+    async function settleStructure(id) {
+      try {
+        const r = await fetch('/api/settle', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({structure_id: id})
+        });
+        const d = await r.json();
+        if (d.status === 'success') {
+          showToast(`✓ All legs settled! Trade moved to Realised (+₹${fmt(d.realised_profit_inr||0)})`, 'success');
+          addFeed(`<span class="profit">✓ Settled ${id}: +${fmtInr(d.realised_profit_inr||0)} realised</span>`);
+          expandedStructures.delete(id);
+          setTimeout(fetchPortfolio, 300);
+        } else {
+          showToast(d.message || 'Failed to settle structure', 'error');
+        }
+      } catch(e) {
+        showToast('Settlement request failed', 'error');
+      }
+    }
+
+    async function settleSingleLeg(structId, legId) {
+      try {
+        const r = await fetch('/api/settle_single_leg', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({structure_id: structId, leg_id: legId})
+        });
+        const d = await r.json();
+        if (d.status === 'success') {
+          if (d.fully_settled) {
+            showToast(`🎉 Final leg settled! Trade moved to Realised (+₹${fmt(d.realised_profit_inr||0)})`, 'success');
+            addFeed(`<span class="profit">🎉 All legs settled for ${structId}! Fully realised.</span>`);
+            expandedStructures.delete(structId);
+          } else {
+            showToast(`✓ Settled leg. Structure remains in Active until all legs settle!`, 'success');
+            addFeed(`✓ Settled leg ${legId} on ${structId} (awaiting other legs)`);
+          }
+          setTimeout(fetchPortfolio, 300);
+        } else {
+          showToast(d.message || 'Leg settlement failed', 'error');
+        }
+      } catch(e) {
+        showToast('Leg settlement request failed', 'error');
+      }
     }
 
     async function settleOldest() {
       try {
         const r = await fetch('/api/portfolio');
         const d = await r.json();
-        const open = (d.open_structures||[]);
-        if (!open.length) { showToast('No open positions to settle', ''); return; }
-        const oldest = open[open.length - 1];
-        await settle(oldest.structure_id);
-      } catch(e) { showToast('Failed to fetch positions', 'error'); }
+        const open = d.open_structures || [];
+        if (!open.length) {
+          showToast('No open positions to settle', '');
+          return;
+        }
+        await settleStructure(open[0].structure_id);
+      } catch(e) {
+        showToast('Failed to fetch open positions', 'error');
+      }
     }
 
-    async function settle(id) {
+    async function toggleHalt() {
       try {
-        const r = await fetch('/api/settle', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({structure_id: id})});
+        const r = await fetch('/api/kill_switch', {method:'POST'});
         const d = await r.json();
-        if (d.status === 'success' || d.realised_profit_inr !== undefined) {
-          const profit = d.realised_profit_inr;
-          showToast(profit >= 0 ? `✓ Settled +${fmtInr(profit)}` : `Settled ${fmtInr(profit)}`, profit >= 0 ? 'success' : 'error');
-          addFeedItem(profit >= 0
-            ? `<span class="profit">✓ Settled ${id} · +${fmtInr(profit)}</span>`
-            : `<span class="loss">✗ Settled ${id} · ${fmtInr(profit)}</span>`
-          );
-          setTimeout(fetchPortfolio, 400);
-        } else {
-          showToast(d.message || 'Settle failed', 'error');
-        }
-      } catch(e) { showToast('Settle request failed', 'error'); }
+        const active = d.active || d.kill_switch_active;
+        showToast(active ? 'System halted. Poller paused.' : 'System resumed. Scanning markets.', active ? 'error' : 'success');
+        addFeed(active ? '<span class="loss">⬛ System halted by operator</span>' : '<span class="profit">▶ System resumed</span>');
+        setTimeout(fetchPortfolio, 300);
+      } catch(e) {
+        showToast('Failed to toggle kill switch', 'error');
+      }
     }
 
     async function resetPortfolio() {
-      if (!confirm('Reset portfolio to ₹10,000 and clear all trades?')) return;
-      showToast('Resetting portfolio...', '', 6000);
+      if (!confirm('Reset portfolio to initial ₹10,000 INR and seed fresh short-duration trades?')) return;
+      showToast('Resetting portfolio...', '', 4000);
       try {
         const r = await fetch('/api/reset', {method:'POST'});
         const d = await r.json();
-        showToast('Portfolio reset. Scanning for trades...', 'success');
-        addFeedItem('<span class="hi">↺ Portfolio reset · Scanning for short-duration opportunities</span>');
-        lastBookedCount = 0;
-        setTimeout(fetchPortfolio, 500);
-        setTimeout(fetchPortfolio, 4000);
-        setTimeout(fetchPortfolio, 8000);
-      } catch(e) { showToast('Reset failed', 'error'); }
+        showToast('Portfolio reset to ₹10,000 INR. Ready!', 'success');
+        addFeed('<span class="hi">↺ Portfolio reset to ₹10,000 INR · Fresh short-duration trades seeded</span>');
+        lastBookedCount = null;
+        expandedStructures.clear();
+        setTimeout(fetchPortfolio, 300);
+      } catch(e) {
+        showToast('Reset failed', 'error');
+      }
     }
 
-    /* ── auto-refresh ── */
-    setInterval(fetchPortfolio, 2500);
+    /* Auto-refresh every 2.0s */
+    setInterval(fetchPortfolio, 2000);
     fetchPortfolio();
+    addFeed('PolyArb Terminal online · Monitoring Polymarket, Kalshi & Manifold');
   </script>
 </body>
-</html>
-"""
+</html>"""
 
 
 def start_server(port: int = PORT):

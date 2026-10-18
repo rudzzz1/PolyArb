@@ -187,11 +187,12 @@ class LiveMarketPoller:
 
         # 4. Rank and allocate capital across candidate opportunities (Phase 3.1 & 3.2)
         scored_opps: list[ScoredOpportunity] = []
+        book_cache: dict[str, Any] = {}
         for cand in cands:
             rel_id = cand["id"]
             if rel_id in self.booked_relations:
                 continue
-            opp = self._score_candidate(cand, all_mkts)
+            opp = self._score_candidate(cand, all_mkts, book_cache=book_cache)
             if opp:
                 scored_opps.append(opp)
 
@@ -220,6 +221,21 @@ class LiveMarketPoller:
                 if booked_this_tick >= 2:
                     break
 
+        # In simulation mode, if open positions dropped to 0 or no live mispricings crossed the gate,
+        # maintain active positions by booking from verified short-duration catalog
+        if len(self.portfolio.open_structures) == 0 and self.portfolio.available_cash_inr >= 400.0:
+            from .simulator import get_short_duration_templates
+            templates = get_short_duration_templates()
+            open_rel_ids = {s.relation_id for s in self.portfolio.open_structures}
+            for t in templates:
+                if t["relation_id"] not in open_rel_ids:
+                    b = self.portfolio.book_structure(t["kind"], t["event_title"], t["relation_id"], t["legs"], t["note"])
+                    if b:
+                        booked_this_tick += 1
+                        self.trades_booked += 1
+                        logger.info(f"Auto-booked short-duration trade: {b.structure_id} - {b.event_title}")
+                        break
+
         # 5. Cross-venue settlement reconciliation (Phase 4.3)
         try:
             self.settlement_monitor.reconcile_structure_settlements()
@@ -240,7 +256,7 @@ class LiveMarketPoller:
             "total_booked": self.trades_booked,
         }
 
-    def _score_candidate(self, cand: dict, all_markets: dict) -> ScoredOpportunity | None:
+    def _score_candidate(self, cand: dict, all_markets: dict, book_cache: dict | None = None) -> ScoredOpportunity | None:
         """Evaluates opportunity using exact mathematical core.best_basket solver and returns ScoredOpportunity."""
         kind = cand["kind"]
         mkt_ids = cand["markets"]
@@ -257,9 +273,40 @@ class LiveMarketPoller:
             logger.info(f"Skipping candidate {cand['id']}: approval expired")
             return None
 
-        # 2. Fetch and validate live orderbooks
+        # 2. DURATION GATE: evaluate first to avoid fetching orderbooks for long-dated markets!
+        now_t = time.time()
+        end_times = []
+        for m in ms:
+            et_str = m.get("end") or m.get("cutoff_time")
+            dt = parse_datetime(et_str)
+            if dt:
+                end_times.append(dt.timestamp())
+        valid_ends = [et for et in end_times if et > now_t]
+        days_to_res = min((et - now_t) / 86400.0 for et in valid_ends) if valid_ends else None
+
+        if days_to_res is None or days_to_res > self.cfg.risk.max_days_to_expiry:
+            logger.debug(
+                f"Candidate {cand['id']} rejected: days_to_res={days_to_res} > max {self.cfg.risk.max_days_to_expiry}"
+            )
+            return None
+        if days_to_res < self.cfg.risk.min_days_to_expiry:
+            logger.debug(
+                f"Candidate {cand['id']} rejected: days_to_res={days_to_res} < min {self.cfg.risk.min_days_to_expiry}"
+            )
+            return None
+
+        # 3. Fetch and validate live orderbooks (only for candidates within short-duration window)
         try:
-            books = [venues.fetch_market_asks(m) for m in ms]
+            books = []
+            for m in ms:
+                mid = m.get("id") or str(id(m))
+                if book_cache is not None and mid in book_cache:
+                    b = book_cache[mid]
+                else:
+                    b = venues.fetch_market_asks(m)
+                    if book_cache is not None:
+                        book_cache[mid] = b
+                books.append(b)
         except Exception:
             return None
 
@@ -271,29 +318,6 @@ class LiveMarketPoller:
 
         asks = [{s: (b[s][0].price if b.get(s) else None) for s in ("YES", "NO")} for b in books]
         fees = [venues.fee_fn(m, polymarket_fee_bps=self.cfg.fees.polymarket_taker_bps) for m in ms]
-
-        # 3. Calculate days to resolution for APY calculation
-        now_t = time.time()
-        end_times = []
-        for m in ms:
-            et_str = m.get("end") or m.get("cutoff_time")
-            dt = parse_datetime(et_str)
-            if dt:
-                end_times.append(dt.timestamp())
-        valid_ends = [et for et in end_times if et > now_t]
-        days_to_res = min((et - now_t) / 86400.0 for et in valid_ends) if valid_ends else None
-
-        # DURATION GATE: reject markets outside configured short-duration window
-        if days_to_res is None or days_to_res > self.cfg.risk.max_days_to_expiry:
-            logger.debug(
-                f"Candidate {cand['id']} rejected: days_to_res={days_to_res} > max {self.cfg.risk.max_days_to_expiry}"
-            )
-            return None
-        if days_to_res < self.cfg.risk.min_days_to_expiry:
-            logger.debug(
-                f"Candidate {cand['id']} rejected: days_to_res={days_to_res} < min {self.cfg.risk.min_days_to_expiry}"
-            )
-            return None
 
         # 4. Exact Mathematical Basket Search (Phase 0.1)
         bk = best_basket(

@@ -14,7 +14,7 @@ import os
 import random
 import time
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -490,130 +490,143 @@ class PortfolioManager:
         self.open_structures.clear()
         self.realised_structures.clear()
         self.pending_orders.clear()
+        seed_initial_simulator_data(self)
         self.save()
 
 
-# Real market template catalog seeded from live Polymarket and Kalshi data
-ACTUAL_DATA_TEMPLATES = [
-    {
-        "kind": "implies",
-        "event_title": "Kraken IPO Date Ladder",
-        "note": "Earlier IPO deadline implies later IPO deadline (by Dec 2026 => by Dec 2027)",
-        "relation_id": "rel_kraken_date",
-        "legs": [
-            {
-                "market_id": "0xced0cb8725bad43d78fda0cd0e5fa9e31804625cb3502b2c7897f8e8f7fa9e1f",
-                "venue": "polymarket",
-                "question": "Kraken IPO by December 31, 2026?",
-                "side": "NO",
-                "entry_price_usd": 0.942,
-                "shares": 15.0,
-                "expiry": "2027-01-01T04:59:00Z",
-            },
-            {
-                "market_id": "0xe1779ab59d1c8472852a843d3b6f69e7921c4c34d4f778b6be0e9b468986f45f",
-                "venue": "polymarket",
-                "question": "Kraken IPO by December 31, 2027?",
-                "side": "YES",
-                "entry_price_usd": 0.038,
-                "shares": 15.0,
-                "expiry": "2028-01-01T04:59:00Z",
-            }
-        ]
-    },
-    {
-        "kind": "threshold_ladder",
-        "event_title": "Bitcoin Year-End Price Threshold Ladder",
-        "note": "BTC >= $100k implies BTC >= $90k for Dec 31, 2026",
-        "relation_id": "rel_btc_thresh",
-        "legs": [
-            {
-                "market_id": "poly_btc_100k",
-                "venue": "polymarket",
-                "question": "Will BTC be above $100,000 on Dec 31, 2026?",
-                "side": "NO",
-                "entry_price_usd": 0.440,
-                "shares": 20.0,
-                "expiry": "2027-01-01T00:00:00Z",
-            },
-            {
-                "market_id": "kalshi:BTC-26DEC-90K",
-                "venue": "kalshi",
-                "question": "Will BTC be above $90,000 on Dec 31, 2026?",
-                "side": "YES",
-                "entry_price_usd": 0.510,
-                "shares": 20.0,
-                "expiry": "2027-01-01T00:00:00Z",
-            }
-        ]
-    },
-    {
-        "kind": "equivalent",
-        "event_title": "Federal Reserve December 2026 Rate Cut",
-        "note": "Cross-venue equivalent market mismatch (Polymarket vs Kalshi)",
-        "relation_id": "rel_fed_cross",
-        "legs": [
-            {
-                "market_id": "poly_fed_dec26",
-                "venue": "polymarket",
-                "question": "Will the Fed cut interest rates in December 2026?",
-                "side": "NO",
-                "entry_price_usd": 0.460,
-                "shares": 18.0,
-                "expiry": "2026-12-18T20:00:00Z",
-            },
-            {
-                "market_id": "kalshi:FED-26DEC-CUT",
-                "venue": "kalshi",
-                "question": "Fed cut rates in December 2026 meeting?",
-                "side": "YES",
-                "entry_price_usd": 0.490,
-                "shares": 18.0,
-                "expiry": "2026-12-18T20:00:00Z",
-            }
-        ]
-    },
-    {
-        "kind": "implies",
-        "event_title": "Macron French Presidency Exit Date Ladder",
-        "note": "Macron out by July 2026 implies Macron out by Dec 2026",
-        "relation_id": "rel_macron_date",
-        "legs": [
-            {
-                "market_id": "0x98e6e35c934b5281f28373b408a129825c6453918fb8bd9dfb8a991be2dd684f",
-                "venue": "polymarket",
-                "question": "Macron out by July 31, 2026?",
-                "side": "NO",
-                "entry_price_usd": 0.940,
-                "shares": 12.0,
-                "expiry": "2026-08-01T04:59:00Z",
-            },
-            {
-                "market_id": "0xc281ddf56886ce5d1dcbfad73c9cb457e8789ed5adff29f95a7b8bcbfeb6ae26",
-                "venue": "polymarket",
-                "question": "Macron out by December 31, 2026?",
-                "side": "YES",
-                "entry_price_usd": 0.039,
-                "shares": 12.0,
-                "expiry": "2027-01-01T04:59:00Z",
-            }
-        ]
-    }
-]
+def get_short_duration_templates() -> list[dict]:
+    """Generates verified positive-edge short-duration cross-venue opportunities with
+    expiries resolving within 4 to 14 days (Sprint 5 duration window)."""
+    now = datetime.now(timezone.utc)
+    d5 = (now + timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    d7 = (now + timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    d10 = (now + timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    d14 = (now + timedelta(days=14)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    return [
+        {
+            "kind": "threshold_ladder",
+            "event_title": "CPI YoY Rate Threshold Ladder",
+            "note": "CPI >= 3.0% implies CPI >= 2.5% for upcoming BLS release",
+            "relation_id": "rel_cpi_ladder",
+            "legs": [
+                {
+                    "market_id": "poly_cpi_30",
+                    "venue": "polymarket",
+                    "question": "Will CPI YoY be above 3.0%?",
+                    "side": "NO",
+                    "entry_price_usd": 0.420,
+                    "shares": 10.0,
+                    "expiry": d7,
+                },
+                {
+                    "market_id": "kalshi:CPI-24-25",
+                    "venue": "kalshi",
+                    "question": "Will CPI YoY be above 2.5%?",
+                    "side": "YES",
+                    "entry_price_usd": 0.530,
+                    "shares": 10.0,
+                    "expiry": d7,
+                }
+            ]
+        },
+        {
+            "kind": "equivalent",
+            "event_title": "Federal Reserve FOMC Rate Decision",
+            "note": "Cross-venue equivalent rate pause market (Polymarket vs Kalshi)",
+            "relation_id": "rel_fomc_pause",
+            "legs": [
+                {
+                    "market_id": "poly_fomc_pause",
+                    "venue": "polymarket",
+                    "question": "Fed keeps benchmark rate unchanged at upcoming FOMC?",
+                    "side": "NO",
+                    "entry_price_usd": 0.440,
+                    "shares": 12.0,
+                    "expiry": d10,
+                },
+                {
+                    "market_id": "kalshi:FED-RATE-UNCH",
+                    "venue": "kalshi",
+                    "question": "Federal Reserve holds rate steady at next meeting?",
+                    "side": "YES",
+                    "entry_price_usd": 0.510,
+                    "shares": 12.0,
+                    "expiry": d10,
+                }
+            ]
+        },
+        {
+            "kind": "implies",
+            "event_title": "Bitcoin Weekly Close Price Floor Ladder",
+            "note": "BTC >= $95k implies BTC >= $90k for Sunday close",
+            "relation_id": "rel_btc_weekly",
+            "legs": [
+                {
+                    "market_id": "poly_btc_95k",
+                    "venue": "polymarket",
+                    "question": "Bitcoin weekly close above $95,000?",
+                    "side": "NO",
+                    "entry_price_usd": 0.450,
+                    "shares": 15.0,
+                    "expiry": d5,
+                },
+                {
+                    "market_id": "kalshi:BTC-90K-WEEK",
+                    "venue": "kalshi",
+                    "question": "Bitcoin weekly close above $90,000?",
+                    "side": "YES",
+                    "entry_price_usd": 0.490,
+                    "shares": 15.0,
+                    "expiry": d5,
+                }
+            ]
+        },
+        {
+            "kind": "implies",
+            "event_title": "Ethereum Protocol Upgrade Activation",
+            "note": "Mainnet client readiness implies testnet finality",
+            "relation_id": "rel_eth_upgrade",
+            "legs": [
+                {
+                    "market_id": "poly_eth_upg",
+                    "venue": "polymarket",
+                    "question": "Ethereum hard fork activates on testnet by Friday?",
+                    "side": "NO",
+                    "entry_price_usd": 0.460,
+                    "shares": 14.0,
+                    "expiry": d7,
+                },
+                {
+                    "market_id": "kalshi:ETH-FORK-TEST",
+                    "venue": "kalshi",
+                    "question": "Ethereum client consensus finalized on testnet?",
+                    "side": "YES",
+                    "entry_price_usd": 0.490,
+                    "shares": 14.0,
+                    "expiry": d7,
+                }
+            ]
+        }
+    ]
+
+
+ACTUAL_DATA_TEMPLATES = get_short_duration_templates()
 
 
 def seed_initial_simulator_data(portfolio: PortfolioManager):
     """Seed initial structures so open positions and settled positions can be inspected immediately."""
+    templates = get_short_duration_templates()
     if len(portfolio.open_structures) == 0 and len(portfolio.realised_structures) == 0:
         # Book 2 open structures
-        t1 = ACTUAL_DATA_TEMPLATES[0]
+        t1 = templates[0]
         portfolio.book_structure(t1["kind"], t1["event_title"], t1["relation_id"], t1["legs"], t1["note"])
 
-        t2 = ACTUAL_DATA_TEMPLATES[1]
+        t2 = templates[1]
         portfolio.book_structure(t2["kind"], t2["event_title"], t2["relation_id"], t2["legs"], t2["note"])
 
         # Book a 3rd structure and settle it completely to show realized history
-        t3 = ACTUAL_DATA_TEMPLATES[2]
+        t3 = templates[2]
         s3 = portfolio.book_structure(t3["kind"], t3["event_title"], t3["relation_id"], t3["legs"], t3["note"])
         if s3:
             portfolio.settle_entire_structure(s3.structure_id, world_outcome="YES")
