@@ -27,6 +27,8 @@ test_files = [
     "tests/test_manifold.py",
     "tests/test_settlement.py",
     "tests/test_costs.py",
+    "tests/test_analytics.py",
+    "tests/test_server.py",
 ]
 
 if __name__ == "__main__":

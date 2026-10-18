@@ -23,6 +23,7 @@ from .config import (
 )
 from .audit import AuditLog
 from .alerts import AlertManager
+from .analytics import AnalyticsEngine
 from .logger import setup_logging, get_logger
 
 PORT = 8085
@@ -32,6 +33,7 @@ logger = setup_logging()
 cfg = Config()
 audit_log = AuditLog(db_path="data/audit.sqlite")
 portfolio = PortfolioManager(initial_capital_inr=10000.0)
+analytics_engine = AnalyticsEngine(data_dir="data")
 poller = LiveMarketPoller(portfolio, interval_sec=5.0, cfg=cfg, audit_log=audit_log)
 
 
@@ -42,17 +44,43 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
-        if parsed.path == "/":
+        if parsed.path in ("/", "/index.html"):
+            index_path = Path(__file__).parent / "static" / "index.html"
+            content = index_path.read_text(encoding="utf-8") if index_path.exists() else HTML_TEMPLATE
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
+            self.wfile.write(content.encode("utf-8"))
+
+        elif parsed.path.startswith("/static/"):
+            rel_path = parsed.path[len("/static/"):]
+            static_dir = (Path(__file__).parent / "static").resolve()
+            static_file = (static_dir / rel_path).resolve()
+            if static_file.is_file() and str(static_file).startswith(str(static_dir)):
+                ext = static_file.suffix.lower()
+                mime = {
+                    ".css": "text/css; charset=utf-8",
+                    ".js": "application/javascript; charset=utf-8",
+                    ".html": "text/html; charset=utf-8",
+                    ".svg": "image/svg+xml",
+                    ".json": "application/json",
+                    ".png": "image/png",
+                }.get(ext, "application/octet-stream")
+                self.send_response(200)
+                self.send_header("Content-Type", mime)
+                self.end_headers()
+                self.wfile.write(static_file.read_bytes())
+            else:
+                self.send_response(404)
+                self.end_headers()
+
         elif parsed.path == "/api/portfolio":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             summary = portfolio.get_summary()
+            analytics_engine.record_snapshot(summary)
             summary["kill_status"] = get_kill_status("data")
             summary["execution_mode"] = poller.approval_gate.mode
             summary["approvals_pending_count"] = len(poller.approval_gate.get_pending_items())
@@ -106,6 +134,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
             data = poller.alert_mgr.get_recent_alerts(limit=50)
             self.wfile.write(json.dumps(data).encode("utf-8"))
 
+        elif parsed.path == "/api/analytics":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            summary = portfolio.get_summary()
+            data = analytics_engine.get_full_analytics(
+                summary=summary,
+                open_structures=portfolio.open_structures,
+                realised_structures=portfolio.realised_structures,
+            )
+            self.wfile.write(json.dumps(data).encode("utf-8"))
+
         elif parsed.path == "/api/audit":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -113,6 +154,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
             events = audit_log.get_events(limit=50)
             self.wfile.write(json.dumps(events).encode("utf-8"))
+
         else:
             self.send_response(404)
             self.end_headers()
@@ -142,6 +184,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 struct_id = portfolio.open_structures[0].structure_id
             if struct_id:
                 portfolio.settle_entire_structure(struct_id)
+                analytics_engine.record_snapshot(portfolio.get_summary())
                 res = {"status": "success", "message": f"Settled all legs of {struct_id}. Trade moved to Realised!"}
                 audit_log.log(action="STRUCTURE_SETTLED", venue="portfolio", order_id=struct_id, status="REALISED")
             else:
@@ -164,6 +207,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
             if struct_id and leg_id:
                 portfolio.settle_single_leg(struct_id, leg_id, outcome="YES")
+                analytics_engine.record_snapshot(portfolio.get_summary())
                 res = {"status": "success", "message": f"Settled leg {leg_id}. Notice: Structure remains in Open Positions until ALL legs settle!"}
                 audit_log.log(action="LEG_SETTLED", venue="portfolio", order_id=f"{struct_id}/{leg_id}", status="SETTLED")
             else:
@@ -191,10 +235,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/api/approvals/approve":
             item_id = body.get("item_id")
+            notes = body.get("notes") or body.get("note")
             if not item_id:
                 res = {"status": "error", "message": "Missing item_id"}
             else:
-                ok, msg = poller.execute_approved_candidate(item_id, approved_by=body.get("approved_by", "operator"))
+                ok, msg = poller.execute_approved_candidate(item_id, approved_by=body.get("approved_by", "operator"), notes=notes)
                 res = {"status": "success" if ok else "error", "message": msg}
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -204,10 +249,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/api/approvals/reject":
             item_id = body.get("item_id")
+            notes = body.get("notes") or body.get("note")
+            reason = body.get("reason", "user_declined")
             if not item_id:
                 res = {"status": "error", "message": "Missing item_id"}
             else:
-                ok, msg, item = poller.approval_gate.reject(item_id, reason=body.get("reason", "user_declined"))
+                ok, msg, item = poller.approval_gate.reject(item_id, reason=reason, notes=notes)
                 res = {"status": "success" if ok else "error", "message": msg}
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -275,6 +322,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/reset":
             portfolio.reset()
             poller.booked_relations.clear()
+            analytics_engine.equity_curve.clear()
+            analytics_engine.save()
             poller.poll_once()
             res = {"status": "success", "message": "Portfolio reset to initial ₹10,000 INR. Polled live markets."}
             audit_log.log(action="PORTFOLIO_RESET", venue="system", status="RESET")

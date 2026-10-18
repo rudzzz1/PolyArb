@@ -36,6 +36,7 @@ class ApprovalItem:
     approved_by: str | None = None
     approved_at: str | None = None
     rejection_reason: str | None = None
+    operator_notes: str | None = None
     execution_result: dict[str, Any] | None = None
 
 
@@ -108,7 +109,7 @@ class ApprovalGate:
         )
         return item
 
-    def approve(self, item_id: str, approved_by: str = "human_operator") -> tuple[bool, str, ApprovalItem | None]:
+    def approve(self, item_id: str, approved_by: str = "human_operator", notes: str | None = None) -> tuple[bool, str, ApprovalItem | None]:
         """Approves a pending candidate."""
         item = self.items.get(item_id)
         if not item:
@@ -127,6 +128,7 @@ class ApprovalGate:
         item.status = "APPROVED"
         item.approved_by = approved_by
         item.approved_at = now_iso
+        item.operator_notes = notes
         self.manual_approved_count += 1
 
         self.audit_log.log(
@@ -134,12 +136,12 @@ class ApprovalGate:
             venue="queue",
             order_id=item_id,
             status="APPROVED",
-            metadata={"approved_by": approved_by, "approved_count": self.manual_approved_count},
+            metadata={"approved_by": approved_by, "notes": notes, "approved_count": self.manual_approved_count},
         )
         logger.info(f"Trade {item_id} APPROVED by {approved_by} (Total approved: {self.manual_approved_count})")
         return True, "Approved successfully", item
 
-    def reject(self, item_id: str, reason: str = "user_declined") -> tuple[bool, str, ApprovalItem | None]:
+    def reject(self, item_id: str, reason: str = "user_declined", notes: str | None = None) -> tuple[bool, str, ApprovalItem | None]:
         """Rejects a pending candidate."""
         item = self.items.get(item_id)
         if not item:
@@ -150,12 +152,13 @@ class ApprovalGate:
 
         item.status = "REJECTED"
         item.rejection_reason = reason
+        item.operator_notes = notes
         self.audit_log.log(
             action="APPROVAL_REJECTED",
             venue="queue",
             order_id=item_id,
             status="REJECTED",
-            metadata={"reason": reason},
+            metadata={"reason": reason, "notes": notes},
         )
         logger.info(f"Trade {item_id} REJECTED: {reason}")
         return True, f"Rejected: {reason}", item
@@ -178,6 +181,13 @@ class ApprovalGate:
         return [self._item_dict(i) for i in sorted_items[:limit]]
 
     def _item_dict(self, item: ApprovalItem) -> dict[str, Any]:
+        ttl_remaining = 0.0
+        try:
+            exp_dt = datetime.fromisoformat(item.expires_at)
+            ttl_remaining = max(0.0, round((exp_dt - datetime.now(timezone.utc)).total_seconds(), 1))
+        except Exception:
+            pass
+
         return {
             "id": item.id,
             "relation_id": item.relation_id,
@@ -193,8 +203,10 @@ class ApprovalGate:
             "risk_flags": item.risk_flags,
             "created_at": item.created_at,
             "expires_at": item.expires_at,
+            "ttl_remaining_sec": ttl_remaining,
             "status": item.status,
             "approved_by": item.approved_by,
             "approved_at": item.approved_at,
             "rejection_reason": item.rejection_reason,
+            "operator_notes": item.operator_notes,
         }

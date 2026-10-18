@@ -389,14 +389,22 @@ class LiveMarketPoller:
             p = asks[i][s]
             exp = m.get("end") or m.get("cutoff_time") or ""
             depth = sum(lvl.size for lvl in books[i].get(s, [])) if books[i].get(s) else 100.0
+            v = m.get("venue", "polymarket")
+            default_res_source = "UMA Oracle (Polygon)" if v == "polymarket" else ("CFTC Official Settlement" if v == "kalshi" else "Community Resolution")
+            res_source = m.get("resolution_source") or default_res_source
+            rules = m.get("rules_primary") or m.get("resolution_rules") or m.get("description") or m.get("question") or "Standard market settlement criteria."
+
             legs_info.append({
                 "market_id": m["id"],
-                "venue": m.get("venue", "polymarket"),
+                "venue": v,
                 "question": m.get("question", ""),
                 "side": s,
                 "entry_price_usd": p,
                 "shares": shares,
                 "expiry": exp,
+                "resolution_source": res_source,
+                "rules_summary": rules[:280] + ("..." if len(rules) > 280 else ""),
+                "description": m.get("description", "")[:280],
             })
             orchestrated_legs.append(OrchestratedLeg(
                 market_id=m["id"],
@@ -558,9 +566,9 @@ class LiveMarketPoller:
                         metadata={"realised_profit_inr": struct.realised_profit_inr}
                     )
 
-    def execute_approved_candidate(self, item_id: str, approved_by: str = "operator") -> tuple[bool, str]:
+    def execute_approved_candidate(self, item_id: str, approved_by: str = "operator", notes: str | None = None) -> tuple[bool, str]:
         """Executes a previously queued candidate upon operator approval."""
-        ok, msg, item = self.approval_gate.approve(item_id, approved_by=approved_by)
+        ok, msg, item = self.approval_gate.approve(item_id, approved_by=approved_by, notes=notes)
         if not ok or not item:
             return False, msg
 
