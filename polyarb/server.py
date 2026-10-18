@@ -14,10 +14,15 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse
 
+import asyncio
 from .simulator import PortfolioManager
 from .poller import LiveMarketPoller
-from .config import Config, is_kill_switch_active, trigger_kill_switch
+from .config import (
+    Config, is_kill_switch_active, is_hard_kill_active, is_soft_kill_active,
+    trigger_kill_switch, clear_kill_switch, get_kill_status
+)
 from .audit import AuditLog
+from .alerts import AlertManager
 from .logger import setup_logging, get_logger
 
 PORT = 8085
@@ -48,6 +53,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             summary = portfolio.get_summary()
+            summary["kill_status"] = get_kill_status("data")
+            summary["execution_mode"] = poller.approval_gate.mode
+            summary["approvals_pending_count"] = len(poller.approval_gate.get_pending_items())
             poller_data = {
                 "last_poll_time": poller.last_poll_time,
                 "poll_count": poller.poll_count,
@@ -56,6 +64,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "last_status": poller.last_status,
                 "active_sources": poller.active_sources,
                 "min_edge": poller.cfg.risk.min_edge,
+                "execution_mode": poller.approval_gate.mode,
             }
             data = {
                 "summary": summary,
@@ -65,6 +74,38 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "pending_orders": portfolio.pending_orders,
             }
             self.wfile.write(json.dumps(data).encode("utf-8"))
+
+        elif parsed.path == "/api/approvals":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            data = {
+                "mode": poller.approval_gate.mode,
+                "pending": poller.approval_gate.get_pending_items(),
+                "history": poller.approval_gate.get_all_items(limit=30),
+                "manual_approved_count": poller.approval_gate.manual_approved_count,
+                "auto_mode_threshold": poller.approval_gate.auto_mode_threshold,
+                "is_auto_allowed": poller.approval_gate.is_auto_allowed(),
+            }
+            self.wfile.write(json.dumps(data).encode("utf-8"))
+
+        elif parsed.path == "/api/reconciliation":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            data = poller.reconciliation_mgr.get_summary()
+            self.wfile.write(json.dumps(data).encode("utf-8"))
+
+        elif parsed.path == "/api/alerts":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            data = poller.alert_mgr.get_recent_alerts(limit=50)
+            self.wfile.write(json.dumps(data).encode("utf-8"))
+
         elif parsed.path == "/api/audit":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -148,19 +189,82 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"status": "success", "message": msg}).encode("utf-8"))
 
-        elif parsed.path == "/api/toggle_kill":
-            if is_kill_switch_active("data"):
-                p = Path("data/KILL_SWITCH")
-                if p.exists():
-                    p.unlink()
-                if "POLYARB_KILL_SWITCH" in os.environ:
-                    del os.environ["POLYARB_KILL_SWITCH"]
-                res = {"status": "success", "kill_switch": False, "message": "Kill switch deactivated. Operations resumed."}
-                audit_log.log(action="KILL_SWITCH_DEACTIVATED", venue="system", status="RESUMED")
+        elif parsed.path == "/api/approvals/approve":
+            item_id = body.get("item_id")
+            if not item_id:
+                res = {"status": "error", "message": "Missing item_id"}
             else:
-                trigger_kill_switch("Manual UI toggle", data_dir="data")
-                res = {"status": "success", "kill_switch": True, "message": "Kill switch activated. Operations halted."}
-                audit_log.log(action="KILL_SWITCH_ACTIVATED", venue="system", status="HALTED")
+                ok, msg = poller.execute_approved_candidate(item_id, approved_by=body.get("approved_by", "operator"))
+                res = {"status": "success" if ok else "error", "message": msg}
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(res).encode("utf-8"))
+
+        elif parsed.path == "/api/approvals/reject":
+            item_id = body.get("item_id")
+            if not item_id:
+                res = {"status": "error", "message": "Missing item_id"}
+            else:
+                ok, msg, item = poller.approval_gate.reject(item_id, reason=body.get("reason", "user_declined"))
+                res = {"status": "success" if ok else "error", "message": msg}
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(res).encode("utf-8"))
+
+        elif parsed.path == "/api/approvals/mode":
+            new_mode = body.get("mode", "PAPER")
+            ok, msg = poller.approval_gate.set_mode(new_mode)
+            res = {"status": "success" if ok else "error", "message": msg, "mode": poller.approval_gate.mode}
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(res).encode("utf-8"))
+
+        elif parsed.path == "/api/reconcile_balances":
+            loop = asyncio.new_event_loop()
+            try:
+                poly_avail = portfolio.balance_polymarket_usd
+                kalshi_avail = portfolio.balance_kalshi_usd
+                recs = loop.run_until_complete(poller.reconciliation_mgr.reconcile_venue_balances(poller.router, poly_avail, kalshi_avail))
+            finally:
+                loop.close()
+            res = {"status": "success", "reconciled": [r.__dict__ for r in recs]}
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(res).encode("utf-8"))
+
+        elif parsed.path == "/api/toggle_kill":
+            mode = body.get("mode", "hard")
+            status = get_kill_status("data")
+            if status["active"]:
+                clear_kill_switch("data", mode="all")
+                res = {
+                    "status": "success",
+                    "kill_switch": False,
+                    "hard_kill": False,
+                    "soft_kill": False,
+                    "message": "All kill switches deactivated. Operations resumed."
+                }
+                audit_log.log(action="KILL_SWITCH_DEACTIVATED", venue="system", status="RESUMED")
+                poller.alert_mgr.notify("INFO", "CIRCUIT_BREAKER", "Kill Switch Deactivated", "All kill switches cleared. Operations resumed.")
+            else:
+                trigger_kill_switch("Manual UI toggle", data_dir="data", mode=mode)
+                res = {
+                    "status": "success",
+                    "kill_switch": True,
+                    "hard_kill": (mode == "hard"),
+                    "soft_kill": (mode == "soft"),
+                    "message": f"{mode.upper()} kill switch activated."
+                }
+                audit_log.log(action=f"{mode.upper()}_KILL_ACTIVATED", venue="system", status="HALTED")
+                poller.alert_mgr.notify("CRITICAL", "CIRCUIT_BREAKER", f"{mode.upper()} Kill Switch Activated", f"Operations halted by operator ({mode}).")
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -517,6 +621,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </span>
     </div>
     <div class="header-controls">
+      <div style="display: flex; align-items: center; gap: 6px;">
+        <span style="font-size: 11px; color: var(--text-muted); font-weight: 600;">MODE:</span>
+        <select id="modeSelect" onchange="changeMode(this.value)" style="background: var(--card-bg); color: var(--accent); border: 1px solid rgba(56, 189, 248, 0.4); padding: 6px 10px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer;">
+          <option value="PAPER">Paper Simulation</option>
+          <option value="HUMAN_APPROVAL">Human Approval Gate</option>
+          <option value="AUTO">Automated Execution</option>
+        </select>
+      </div>
       <button class="btn btn-accent" onclick="pollNow()" title="Trigger immediate live scan across Polymarket & Kalshi">
         ⚡ Poll Now (5s)
       </button>
@@ -529,8 +641,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <button class="btn" onclick="bookNext()">
         ➕ Scan & Book Live Mispricing
       </button>
-      <button class="btn" id="killBtn" onclick="toggleKillSwitch()">
-        🛑 Kill Switch
+      <button class="btn" id="softKillBtn" onclick="toggleKill('soft')" style="border-color: var(--yellow); color: var(--yellow);" title="Stop opening new positions, let existing ones ride to settlement">
+        ⏸ Soft Kill
+      </button>
+      <button class="btn btn-red" id="hardKillBtn" onclick="toggleKill('hard')" title="Emergency halt: cancel orders and halt execution">
+        🛑 Hard Kill
       </button>
       <button class="btn" onclick="resetPortfolio()" title="Reset portfolio back to ₹10,000">
         ↺ Reset
@@ -583,6 +698,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <button class="tab-btn" id="tabRealisedBtn" onclick="switchTab('realised')">
       Realised Positions (All Legs Settled)
       <span class="pill" id="realisedCountPill">0</span>
+    </button>
+    <button class="tab-btn" id="tabApprovalsBtn" onclick="switchTab('approvals')">
+      Approval Queue
+      <span class="pill" id="approvalsCountPill" style="background: rgba(245, 158, 11, 0.2); color: var(--yellow);">0</span>
+    </button>
+    <button class="tab-btn" id="tabReconBtn" onclick="switchTab('recon')">
+      Fill Reconciliation & Slippage
+      <span class="pill" id="reconCountPill">0</span>
+    </button>
+    <button class="tab-btn" id="tabAlertsBtn" onclick="switchTab('alerts')">
+      System Alerts
+      <span class="pill" id="alertsCountPill">0</span>
     </button>
     <button class="tab-btn" id="tabAuditBtn" onclick="switchTab('audit')">
       Audit Trail (Immutable)
@@ -641,6 +768,77 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </table>
   </div>
 
+  <!-- Approvals Tab -->
+  <div id="tabApprovals" class="table-container" style="display: none;">
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Created</th>
+          <th>Strategy</th>
+          <th>Event Title</th>
+          <th>Legs</th>
+          <th>Cost ($)</th>
+          <th>Payoff ($)</th>
+          <th>Net Edge ($)</th>
+          <th>Shares</th>
+          <th>APY</th>
+          <th>Risk Flags</th>
+          <th>Expires In</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody id="approvalsTableBody">
+        <tr><td colspan="13" class="empty-state">No pending trade approvals in queue.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Reconciliation Tab -->
+  <div id="tabRecon" class="table-container" style="display: none;">
+    <div style="padding: 12px 16px; background: rgba(56, 189, 248, 0.05); border-bottom: 1px solid var(--card-border); display: flex; justify-content: space-between; align-items: center;">
+      <span style="font-size: 13px; font-weight: 600;">Fill Slippage & Venue Balance Reconciliation</span>
+      <button class="btn btn-accent" onclick="reconcileVenueBalances()">⚡ Reconcile Venue Balances</button>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Reconciliation ID</th>
+          <th>Timestamp (UTC)</th>
+          <th>Venue</th>
+          <th>Order ID</th>
+          <th>Side</th>
+          <th>Expected Price ($)</th>
+          <th>Actual Fill Price ($)</th>
+          <th>Slippage (bps)</th>
+          <th>Filled Qty</th>
+          <th>Fee Paid ($)</th>
+        </tr>
+      </thead>
+      <tbody id="reconTableBody">
+        <tr><td colspan="10" class="empty-state">No fills reconciled yet.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Alerts Tab -->
+  <div id="tabAlerts" class="table-container" style="display: none;">
+    <table>
+      <thead>
+        <tr>
+          <th>Timestamp (UTC)</th>
+          <th>Level</th>
+          <th>Category</th>
+          <th>Title</th>
+          <th>Message</th>
+        </tr>
+      </thead>
+      <tbody id="alertsTableBody">
+        <tr><td colspan="5" class="empty-state">No system alerts recorded.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
   <!-- Audit Trail Tab -->
   <div id="tabAudit" class="table-container" style="display: none;">
     <table>
@@ -680,13 +878,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     function switchTab(tab) {
       activeTab = tab;
-      document.getElementById('tabOpenBtn').classList.toggle('active', tab === 'open');
-      document.getElementById('tabRealisedBtn').classList.toggle('active', tab === 'realised');
-      document.getElementById('tabAuditBtn').classList.toggle('active', tab === 'audit');
-      document.getElementById('tabOpen').style.display = tab === 'open' ? 'block' : 'none';
-      document.getElementById('tabRealised').style.display = tab === 'realised' ? 'block' : 'none';
-      document.getElementById('tabAudit').style.display = tab === 'audit' ? 'block' : 'none';
+      const tabs = ['open', 'realised', 'approvals', 'recon', 'alerts', 'audit'];
+      tabs.forEach(t => {
+        const btn = document.getElementById(`tab${t.charAt(0).toUpperCase() + t.slice(1)}Btn`);
+        const el = document.getElementById(`tab${t.charAt(0).toUpperCase() + t.slice(1)}`);
+        if (btn) btn.classList.toggle('active', tab === t);
+        if (el) el.style.display = (tab === t) ? 'block' : 'none';
+      });
       if (tab === 'audit') fetchAuditLog();
+      if (tab === 'approvals') fetchApprovals();
+      if (tab === 'recon') fetchReconciliation();
+      if (tab === 'alerts') fetchAlerts();
     }
 
     function toggleExpand(id) {
@@ -717,6 +919,163 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       } catch (err) {
         console.error(err);
       }
+    }
+
+    async function fetchApprovals() {
+      try {
+        const res = await fetch('/api/approvals');
+        const data = await res.json();
+        renderApprovals(data);
+      } catch (e) { console.error(e); }
+    }
+
+    function renderApprovals(data) {
+      const tbody = document.getElementById('approvalsTableBody');
+      const items = data.pending || [];
+      document.getElementById('approvalsCountPill').innerText = items.length;
+      if (items.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="13" class="empty-state">No pending trade approvals in queue. Switch mode to Human Approval to queue candidate trades.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = items.map(item => `
+        <tr>
+          <td class="mono" style="color: var(--accent); font-weight:600;">${item.id}</td>
+          <td class="mono" style="font-size: 11px;">${item.created_at ? item.created_at.substring(11, 19) : ''}</td>
+          <td><span class="pill mono">${item.kind}</span></td>
+          <td style="font-weight: 500;">${item.event_title}</td>
+          <td class="mono">${item.legs.length} legs</td>
+          <td class="mono">$${item.unit_cost.toFixed(3)}</td>
+          <td class="mono">$${item.expected_payoff.toFixed(3)}</td>
+          <td class="mono" style="color: var(--green); font-weight: 600;">+$${item.net_edge.toFixed(3)}</td>
+          <td class="mono">${item.shares}</td>
+          <td class="mono">${item.apy ? item.apy.toFixed(1) + '%' : '-'}</td>
+          <td>${item.risk_flags.length ? item.risk_flags.map(f => `<span class="badge badge-partial" style="font-size:10px;">${f}</span>`).join(' ') : '<span style="color:var(--green);font-size:11px;">✓ Clean</span>'}</td>
+          <td class="mono" style="font-size:11px; color: var(--yellow);">${item.expires_at ? item.expires_at.substring(11, 19) : ''}</td>
+          <td>
+            <div style="display: flex; gap: 4px;">
+              <button class="btn btn-green" style="padding: 4px 8px; font-size: 11px;" onclick="approveItem('${item.id}')">✔ Approve</button>
+              <button class="btn btn-red" style="padding: 4px 8px; font-size: 11px;" onclick="rejectItem('${item.id}')">✖ Reject</button>
+            </div>
+          </td>
+        </tr>
+      `).join('');
+    }
+
+    async function approveItem(id) {
+      showToast('Executing approved trade via Orchestrator...');
+      const res = await fetch('/api/approvals/approve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ item_id: id, approved_by: 'operator' }),
+      });
+      const data = await res.json();
+      showToast(data.message);
+      fetchApprovals();
+      fetchPortfolio();
+      if (activeTab === 'audit') fetchAuditLog();
+    }
+
+    async function rejectItem(id) {
+      const res = await fetch('/api/approvals/reject', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ item_id: id, reason: 'user_declined' }),
+      });
+      const data = await res.json();
+      showToast(data.message);
+      fetchApprovals();
+      if (activeTab === 'audit') fetchAuditLog();
+    }
+
+    async function changeMode(newMode) {
+      const res = await fetch('/api/approvals/mode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: newMode }),
+      });
+      const data = await res.json();
+      showToast(data.message);
+      fetchPortfolio();
+    }
+
+    async function fetchReconciliation() {
+      try {
+        const res = await fetch('/api/reconciliation');
+        const data = await res.json();
+        renderReconciliation(data);
+      } catch (e) { console.error(e); }
+    }
+
+    function renderReconciliation(data) {
+      const tbody = document.getElementById('reconTableBody');
+      const fills = data.recent_fills || [];
+      document.getElementById('reconCountPill').innerText = fills.length;
+      if (fills.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="10" class="empty-state">No fills reconciled yet.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = fills.map(f => `
+        <tr>
+          <td class="mono" style="color: var(--text-dim);">${f.order_id}</td>
+          <td class="mono" style="font-size: 11px;">${f.timestamp ? f.timestamp.substring(11, 19) : ''}</td>
+          <td><span class="badge ${f.venue === 'kalshi' ? 'badge-kalshi' : 'badge-polymarket'}">${f.venue}</span></td>
+          <td class="mono">${f.order_id}</td>
+          <td><span class="badge badge-open">BUY</span></td>
+          <td class="mono">$${(f.expected_price||0).toFixed(3)}</td>
+          <td class="mono">$${(f.actual_price||0).toFixed(3)}</td>
+          <td class="mono" style="color: ${f.slippage_bps > 20 ? 'var(--yellow)' : 'var(--green)'}; font-weight:600;">${f.slippage_bps > 0 ? '+' : ''}${f.slippage_bps.toFixed(1)}</td>
+          <td class="mono">-</td>
+          <td class="mono">-</td>
+        </tr>
+      `).join('');
+    }
+
+    async function reconcileVenueBalances() {
+      showToast('Reconciling venue balances against live APIs...');
+      const res = await fetch('/api/reconcile_balances', { method: 'POST' });
+      const data = await res.json();
+      showToast('Balance check completed!');
+      fetchReconciliation();
+      fetchPortfolio();
+    }
+
+    async function fetchAlerts() {
+      try {
+        const res = await fetch('/api/alerts');
+        const alerts = await res.json();
+        renderAlerts(alerts);
+      } catch (e) { console.error(e); }
+    }
+
+    function renderAlerts(alerts) {
+      const tbody = document.getElementById('alertsTableBody');
+      document.getElementById('alertsCountPill').innerText = alerts.length;
+      if (!alerts || alerts.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="5" class="empty-state">No system alerts recorded.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = alerts.map(a => `
+        <tr>
+          <td class="mono" style="font-size: 11px;">${a.timestamp ? a.timestamp.substring(11, 19) : ''}</td>
+          <td><span class="badge ${a.level === 'CRITICAL' ? 'badge-no' : (a.level === 'WARNING' ? 'badge-partial' : 'badge-open')}">${a.level}</span></td>
+          <td><span class="pill mono">${a.category}</span></td>
+          <td style="font-weight:600;">${a.title}</td>
+          <td style="color: var(--text-dim);">${a.message}</td>
+        </tr>
+      `).join('');
+    }
+
+    async function toggleKill(mode) {
+      const res = await fetch('/api/toggle_kill', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: mode }),
+      });
+      const data = await res.json();
+      showToast(data.message);
+      fetchPortfolio();
+      if (activeTab === 'alerts') fetchAlerts();
+      if (activeTab === 'audit') fetchAuditLog();
     }
 
     function renderAuditEvents(events) {
@@ -774,13 +1133,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         document.getElementById('pollerStatusText').innerText = `5s Poller Active (${poller.last_poll_time}) | Edge Gate ≥ ${(poller.min_edge*100).toFixed(1)}% | Booked: ${poller.trades_booked}`;
       }
 
-      const killBtn = document.getElementById('killBtn');
-      if (s.kill_switch_active) {
-        killBtn.innerText = '⚠ RESUME (KILLED)';
-        killBtn.className = 'btn btn-red';
+      // Update Kill Switch Buttons
+      const hardBtn = document.getElementById('hardKillBtn');
+      const softBtn = document.getElementById('softKillBtn');
+      const ks = s.kill_status || {};
+      if (ks.hard_kill) {
+        if (hardBtn) { hardBtn.innerText = '⚠ RESUME HARD'; hardBtn.className = 'btn btn-red'; }
+        if (softBtn) { softBtn.style.opacity = '0.5'; }
+      } else if (ks.soft_kill) {
+        if (softBtn) { softBtn.innerText = '⚠ RESUME SOFT'; softBtn.className = 'btn btn-red'; }
+        if (hardBtn) { hardBtn.innerText = '🛑 Hard Kill'; hardBtn.className = 'btn btn-red'; }
       } else {
-        killBtn.innerText = '🛑 Kill Switch';
-        killBtn.className = 'btn';
+        if (hardBtn) { hardBtn.innerText = '🛑 Hard Kill'; hardBtn.className = 'btn btn-red'; }
+        if (softBtn) { softBtn.innerText = '⏸ Soft Kill'; softBtn.className = 'btn'; softBtn.style.opacity = '1'; }
+      }
+
+      // Update Mode select
+      const modeSelect = document.getElementById('modeSelect');
+      if (modeSelect && s.execution_mode) {
+        modeSelect.value = s.execution_mode;
+      }
+      if (document.getElementById('approvalsCountPill')) {
+        document.getElementById('approvalsCountPill').innerText = s.approvals_pending_count || 0;
       }
 
       // Render Open Structures

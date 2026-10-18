@@ -4,6 +4,7 @@ import os
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 
 @dataclass
@@ -67,18 +68,66 @@ class Config:
 DEFAULT_CONFIG = Config()
 
 
-def is_kill_switch_active(data_dir: str | Path = "data") -> bool:
-    """Check if the emergency stop kill switch has been triggered via env var or file flag."""
+def is_hard_kill_active(data_dir: str | Path = "data") -> bool:
+    """Check if emergency hard kill switch is active (cancels resting orders and halts all trading)."""
     if os.environ.get("POLYARB_KILL_SWITCH", "").strip().lower() in ("1", "true", "yes", "stop"):
         return True
     d = Path(data_dir)
     return (d / "KILL_SWITCH").exists() or Path("KILL_SWITCH").exists()
 
 
-def trigger_kill_switch(reason: str, data_dir: str | Path = "data"):
-    """Write kill switch file to immediately halt execution."""
+def is_soft_kill_active(data_dir: str | Path = "data") -> bool:
+    """Check if soft kill mode is active (stops opening new trades, lets existing ride to settlement)."""
+    if is_hard_kill_active(data_dir):
+        return True
+    if os.environ.get("POLYARB_SOFT_KILL", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    d = Path(data_dir)
+    return (d / "SOFT_KILL").exists() or Path("SOFT_KILL").exists()
+
+
+def is_kill_switch_active(data_dir: str | Path = "data") -> bool:
+    """Default kill switch check (True if either soft or hard kill is triggered)."""
+    return is_soft_kill_active(data_dir)
+
+
+def trigger_kill_switch(reason: str, data_dir: str | Path = "data", mode: str = "hard"):
+    """Write kill switch file to immediately halt execution. mode='hard' | 'soft'."""
     d = Path(data_dir)
     d.mkdir(parents=True, exist_ok=True)
-    p = d / "KILL_SWITCH"
-    p.write_text(f"KILLED: {reason}\n", encoding="utf-8")
-    print(f"[CIRCUIT BREAKER TRIGGERED] {reason} -> written to {p}")
+    filename = "SOFT_KILL" if mode.lower() == "soft" else "KILL_SWITCH"
+    p = d / filename
+    p.write_text(f"KILLED ({mode.upper()}): {reason}\n", encoding="utf-8")
+    print(f"[CIRCUIT BREAKER TRIGGERED] {mode.upper()} KILL: {reason} -> written to {p}")
+
+
+def clear_kill_switch(data_dir: str | Path = "data", mode: str = "all"):
+    """Clears kill switch files and resets environment variables."""
+    d = Path(data_dir)
+    if mode in ("all", "hard"):
+        p = d / "KILL_SWITCH"
+        if p.exists(): p.unlink()
+        if Path("KILL_SWITCH").exists(): Path("KILL_SWITCH").unlink()
+        if "POLYARB_KILL_SWITCH" in os.environ: del os.environ["POLYARB_KILL_SWITCH"]
+    if mode in ("all", "soft"):
+        p = d / "SOFT_KILL"
+        if p.exists(): p.unlink()
+        if Path("SOFT_KILL").exists(): Path("SOFT_KILL").unlink()
+        if "POLYARB_SOFT_KILL" in os.environ: del os.environ["POLYARB_SOFT_KILL"]
+
+
+def get_kill_status(data_dir: str | Path = "data") -> dict[str, Any]:
+    hard = is_hard_kill_active(data_dir)
+    soft = is_soft_kill_active(data_dir)
+    reason = ""
+    d = Path(data_dir)
+    if (d / "KILL_SWITCH").exists():
+        reason = (d / "KILL_SWITCH").read_text(encoding="utf-8").strip()
+    elif (d / "SOFT_KILL").exists():
+        reason = (d / "SOFT_KILL").read_text(encoding="utf-8").strip()
+    return {
+        "active": hard or soft,
+        "hard_kill": hard,
+        "soft_kill": soft,
+        "reason": reason,
+    }

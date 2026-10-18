@@ -21,6 +21,10 @@ from .matcher import parse_datetime, is_approval_expired
 from .simulator import PortfolioManager, INR_PER_USD, format_expiry
 from .audit import AuditLog
 from .executor import ExecutionRouter, OrderRequest
+from .orchestrator import ExecutionOrchestrator, OrchestratedLeg, OrchestrationPlan
+from .approval_gate import ApprovalGate
+from .reconciliation import ReconciliationManager
+from .alerts import AlertManager
 from .logger import get_logger, set_trace_id
 
 logger = get_logger("poller")
@@ -29,12 +33,25 @@ logger = get_logger("poller")
 class LiveMarketPoller:
     def __init__(self, portfolio: PortfolioManager, interval_sec: float = 5.0,
                  cfg: Config | None = None, audit_log: AuditLog | None = None,
-                 router: ExecutionRouter | None = None):
+                 router: ExecutionRouter | None = None,
+                 orchestrator: ExecutionOrchestrator | None = None,
+                 approval_gate: ApprovalGate | None = None,
+                 reconciliation_mgr: ReconciliationManager | None = None,
+                 alert_mgr: AlertManager | None = None):
         self.portfolio = portfolio
         self.interval_sec = interval_sec
         self.cfg = cfg or Config()
         self.audit_log = audit_log or AuditLog(db_path=self.portfolio.data_dir / "audit.sqlite")
         self.router = router or ExecutionRouter(audit_log=self.audit_log, dry_run=True)
+        self.alert_mgr = alert_mgr or AlertManager.get_instance()
+        self.orchestrator = orchestrator or ExecutionOrchestrator(
+            router=self.router,
+            audit_log=self.audit_log,
+            cfg=self.cfg,
+            alert_mgr=self.alert_mgr,
+        )
+        self.approval_gate = approval_gate or ApprovalGate(audit_log=self.audit_log, mode="PAPER")
+        self.reconciliation_mgr = reconciliation_mgr or ReconciliationManager(audit_log=self.audit_log, alert_mgr=self.alert_mgr)
 
         self.running = False
         self._thread: threading.Thread | None = None
@@ -253,11 +270,12 @@ class LiveMarketPoller:
 
         # Build legs
         legs_info = []
-        order_requests = []
+        orchestrated_legs = []
         for i, s in bk.legs:
             m = ms[i]
             p = asks[i][s]
             exp = m.get("end") or m.get("cutoff_time") or ""
+            depth = sum(lvl.size for lvl in books[i].get(s, [])) if books[i].get(s) else 100.0
             legs_info.append({
                 "market_id": m["id"],
                 "venue": m.get("venue", "polymarket"),
@@ -267,14 +285,18 @@ class LiveMarketPoller:
                 "shares": shares,
                 "expiry": exp,
             })
-            order_requests.append(OrderRequest(
+            orchestrated_legs.append(OrchestratedLeg(
                 market_id=m["id"],
                 venue=m.get("venue", "polymarket"),
                 side=s,
-                price=p,
+                expected_price=p,
                 size=shares,
+                available_depth=depth,
+                expiry=exp,
                 order_type="IOC",
             ))
+
+        event_title = ms[0].get("event_title") or f"{kind.title()} Arbitrage Structure"
 
         # Check venue balance limits
         poly_cost_usd = sum(l["shares"] * l["entry_price_usd"] for l in legs_info if l["venue"] == "polymarket")
@@ -288,18 +310,58 @@ class LiveMarketPoller:
             logger.info(f"Skipping {cand['id']}: Kalshi venue capital cap exceeded")
             return False
 
-        # Execute through ExecutionRouter (Phase 1.3)
+        # Human-in-the-Loop Gate (Phase 2.2)
+        if self.approval_gate.mode == "HUMAN_APPROVAL":
+            self.approval_gate.submit_for_approval(
+                relation_id=cand["id"],
+                kind=kind,
+                event_title=event_title,
+                legs=legs_info,
+                unit_cost=bk.cost,
+                expected_payoff=bk.payoff,
+                net_edge=bk.edge,
+                shares=shares,
+                apy=bk.annualized_return,
+                risk_flags=cand.get("risk_flags", []),
+            )
+            return True
+
+        # Execute through ExecutionOrchestrator with sequencing and auto-unwind (Phase 2.1)
+        plan = OrchestrationPlan(
+            structure_id=f"STR-{int(time.time()*1000)%1000000:06d}",
+            relation_id=cand["id"],
+            kind=kind,
+            legs=orchestrated_legs,
+            expected_edge=bk.edge,
+            expected_payoff=bk.payoff,
+            expected_cost=bk.cost,
+            metadata={"event_title": event_title},
+        )
+
         loop = asyncio.new_event_loop()
         try:
-            exec_results = loop.run_until_complete(self.router.execute_structure(order_requests))
+            orch_res = loop.run_until_complete(self.orchestrator.execute_plan(plan))
         finally:
             loop.close()
 
-        if any(r.status != "FILLED" for r in exec_results):
-            logger.warning(f"Candidate {cand['id']} rejected: one or more legs failed execution.")
+        if orch_res.status != "COMPLETED":
+            logger.warning(f"Candidate {cand['id']} orchestration rejected (status: {orch_res.status}, error: {orch_res.error_message})")
             return False
 
-        event_title = ms[0].get("event_title") or f"{kind.title()} Arbitrage Structure"
+        # Fill Reconciliation & Slippage Tracking (Phase 2.3)
+        for idx, rec in enumerate(orch_res.leg_records):
+            orig_leg = orchestrated_legs[idx]
+            self.reconciliation_mgr.reconcile_fill(
+                order_id=rec.order_id,
+                venue=rec.venue,
+                market_id=rec.market_id,
+                side=rec.side,
+                expected_price=orig_leg.expected_price,
+                actual_price=rec.avg_price,
+                expected_size=orig_leg.size,
+                filled_size=rec.filled_size,
+                fee_paid=rec.fee_paid,
+            )
         note = (f"Mathematically verified edge: +${bk.edge:.4f}/sh | Payoff: ${bk.payoff:.2f}/sh | "
                 f"Slippage: {sweep_res.slippage_bps:.0f}bps | APY: {bk.annualized_return:.1f}%")
 
@@ -356,3 +418,72 @@ class LiveMarketPoller:
                         status="REALISED",
                         metadata={"realised_profit_inr": struct.realised_profit_inr}
                     )
+
+    def execute_approved_candidate(self, item_id: str, approved_by: str = "operator") -> tuple[bool, str]:
+        """Executes a previously queued candidate upon operator approval."""
+        ok, msg, item = self.approval_gate.approve(item_id, approved_by=approved_by)
+        if not ok or not item:
+            return False, msg
+
+        # Build orchestration plan
+        orchestrated_legs = []
+        for l in item.legs:
+            orchestrated_legs.append(OrchestratedLeg(
+                market_id=l["market_id"],
+                venue=l["venue"],
+                side=l["side"],
+                expected_price=l["entry_price_usd"],
+                size=item.shares,
+                expiry=l.get("expiry", ""),
+                order_type="IOC",
+            ))
+
+        plan = OrchestrationPlan(
+            structure_id=f"STR-{int(time.time()*1000)%1000000:06d}",
+            relation_id=item.relation_id,
+            kind=item.kind,
+            legs=orchestrated_legs,
+            expected_edge=item.net_edge,
+            expected_payoff=item.expected_payoff,
+            expected_cost=item.unit_cost,
+            metadata={"event_title": item.event_title},
+        )
+
+        loop = asyncio.new_event_loop()
+        try:
+            orch_res = loop.run_until_complete(self.orchestrator.execute_plan(plan))
+        finally:
+            loop.close()
+
+        if orch_res.status != "COMPLETED":
+            return False, f"Orchestration failed: {orch_res.status} ({orch_res.error_message})"
+
+        # Fill reconciliation
+        for idx, rec in enumerate(orch_res.leg_records):
+            orig_leg = orchestrated_legs[idx]
+            self.reconciliation_mgr.reconcile_fill(
+                order_id=rec.order_id,
+                venue=rec.venue,
+                market_id=rec.market_id,
+                side=rec.side,
+                expected_price=orig_leg.expected_price,
+                actual_price=rec.avg_price,
+                expected_size=orig_leg.size,
+                filled_size=rec.filled_size,
+                fee_paid=rec.fee_paid,
+            )
+
+        note = f"Approved by {approved_by} | Verified edge: +${item.net_edge:.4f}/sh | Payoff: ${item.expected_payoff:.2f}/sh"
+        booked = self.portfolio.book_structure(
+            kind=item.kind,
+            event_title=item.event_title,
+            relation_id=item.relation_id,
+            legs_info=item.legs,
+            note=note,
+            unit_payoff=item.expected_payoff,
+        )
+        if booked:
+            item.status = "EXECUTED"
+            item.execution_result = {"structure_id": booked.structure_id, "status": "COMPLETED"}
+            return True, f"Successfully executed & booked {booked.structure_id}!"
+        return False, "Failed to book into portfolio"
