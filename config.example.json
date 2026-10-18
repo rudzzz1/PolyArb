@@ -1,0 +1,8 @@
+{
+  "risk": {
+    "max_days_to_expiry": 30,
+    "min_days_to_expiry": 1,
+    "min_annualized_return": 0.50,
+    "paper_auto_settle_after_hours": 2.0
+  }
+}

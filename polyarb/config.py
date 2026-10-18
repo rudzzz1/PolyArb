@@ -25,6 +25,9 @@ class RiskLimits:
     approval_expiry_days: int = 30               # human approvals expire after N days
     simulate_execution_delay_s: float = 0.25     # execution delay between leg 1 and leg 2 in replay/simulation
     model_void_outcomes: bool = False            # include void/refund worlds in worst-case payoff (stress test mode)
+    max_days_to_expiry: float = 30.0             # reject candidates resolving more than N days out
+    min_days_to_expiry: float = 1.0              # reject candidates resolving sooner than N days (avoid same-day noise)
+    paper_auto_settle_after_hours: float = 0.0   # if > 0, auto-settle open structures this many hours after booking (paper mode)
 
 
 @dataclass

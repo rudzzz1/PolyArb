@@ -75,7 +75,14 @@ class OpportunityScorer:
             velocity_multiplier = 1.0
 
         net_edge = max(0.0, edge - non_trading_cost)
-        score = net_edge * velocity_multiplier * risk_factor
+
+        # Short-duration turnaround boost: trades resolving within 14 days get up to 2× boost
+        if days_to_res and 0 < days_to_res < 14:
+            duration_boost = min(2.0, 14.0 / max(days_to_res, 0.5))
+        else:
+            duration_boost = 1.0
+
+        score = net_edge * velocity_multiplier * risk_factor * duration_boost
         return round(score, 6), round(risk_factor, 4)
 
 

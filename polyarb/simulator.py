@@ -432,8 +432,52 @@ class PortfolioManager:
             self.open_structures = [to_struct(s) for s in data.get("open_structures", [])]
             self.realised_structures = [to_struct(s) for s in data.get("realised_structures", [])]
             self.pending_orders = data.get("pending_orders", [])
+            self._purge_invalid_structures()
         except Exception as e:
             print(f"[portfolio] Error loading state: {e}")
+
+    def _purge_invalid_structures(self):
+        """Remove open structures with negative projected profit — these are legacy seed data
+        from before the mathematical edge gate was applied. Purging them restores accurate
+        portfolio accounting and prevents negative 'Projected Edge' display in the UI.
+        Also removes structures that have already expired (past expiry date) without being settled."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        valid = []
+        purged = 0
+        fx_rate = get_current_fx_rate()
+
+        for struct in self.open_structures:
+            # Purge if projected profit is negative (structural loss — pre-gate legacy trade)
+            if struct.projected_profit_usd < -0.001:
+                print(f"[portfolio] Purging negative-edge legacy structure {struct.structure_id} "
+                      f"(projected profit: ${struct.projected_profit_usd:.4f})")
+                # Return the locked capital to available cash (no profit/loss on purge)
+                self.available_cash_inr += struct.total_cost_inr
+                self.available_cash_usd += struct.total_cost_usd
+                purged += 1
+                continue
+
+            # Purge if structure has already expired (expiry date passed) — these will never settle naturally
+            if struct.expiry:
+                try:
+                    exp_dt = datetime.fromisoformat(struct.expiry.replace("Z", "+00:00"))
+                    if exp_dt.isoformat() < now_iso:
+                        print(f"[portfolio] Purging already-expired structure {struct.structure_id} "
+                              f"(expiry: {struct.expiry})")
+                        self.available_cash_inr += struct.total_cost_inr
+                        self.available_cash_usd += struct.total_cost_usd
+                        purged += 1
+                        continue
+                except Exception:
+                    pass
+
+            valid.append(struct)
+
+        if purged > 0:
+            self.open_structures = valid
+            self.save()
+            print(f"[portfolio] Purged {purged} invalid/expired structures. "
+                  f"Available cash restored to INR {self.available_cash_inr:.2f}")
 
     def reset(self):
         """Reset portfolio back to initial state."""

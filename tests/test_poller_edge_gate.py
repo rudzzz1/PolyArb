@@ -52,9 +52,11 @@ def test_poller_books_verified_positive_edge():
             "markets": ["m1", "m2"],
         }
         # Favorable asks: NO(m1) ask = 0.45, YES(m2) ask = 0.45 -> sum = 0.90 < 1.00 (Edge = +0.10)
+        from datetime import datetime, timezone, timedelta
+        valid_end = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
         all_markets = {
-            "m1": {"id": "m1", "venue": "polymarket", "question": "Event A?"},
-            "m2": {"id": "m2", "venue": "polymarket", "question": "Event B?"},
+            "m1": {"id": "m1", "venue": "polymarket", "question": "Event A?", "end": valid_end},
+            "m2": {"id": "m2", "venue": "polymarket", "question": "Event B?", "end": valid_end},
         }
 
         import polyarb.venues as venues

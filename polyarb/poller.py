@@ -283,6 +283,18 @@ class LiveMarketPoller:
         valid_ends = [et for et in end_times if et > now_t]
         days_to_res = min((et - now_t) / 86400.0 for et in valid_ends) if valid_ends else None
 
+        # DURATION GATE: reject markets outside configured short-duration window
+        if days_to_res is None or days_to_res > self.cfg.risk.max_days_to_expiry:
+            logger.debug(
+                f"Candidate {cand['id']} rejected: days_to_res={days_to_res} > max {self.cfg.risk.max_days_to_expiry}"
+            )
+            return None
+        if days_to_res < self.cfg.risk.min_days_to_expiry:
+            logger.debug(
+                f"Candidate {cand['id']} rejected: days_to_res={days_to_res} < min {self.cfg.risk.min_days_to_expiry}"
+            )
+            return None
+
         # 4. Exact Mathematical Basket Search (Phase 0.1)
         bk = best_basket(
             kind=kind,
@@ -550,21 +562,45 @@ class LiveMarketPoller:
         return self._execute_allocated_opportunity(allocations[0])
 
     def _check_natural_expiry_settlements(self, now_dt: datetime):
-        """Monitors open structures: if contract expiry timestamp has passed, settle all legs.
+        """Monitors open structures: settle if contract expiry has passed, OR if paper
+        auto-settle is configured and the structure has been open long enough.
         Trade moves to Realised ONLY when all legs settle."""
+        paper_settle_hours = self.cfg.risk.paper_auto_settle_after_hours
         for struct in list(self.portfolio.open_structures):
+            should_settle = False
+            reason = ""
+
+            # Standard path: real expiry date has passed
             if struct.expiry:
                 dt_exp = parse_datetime(struct.expiry)
                 if dt_exp and now_dt >= dt_exp:
-                    logger.info(f"[POLLER SETTLEMENT] Contract {struct.structure_id} reached expiry ({struct.expiry_display}). Settling all legs...")
-                    self.portfolio.settle_entire_structure(struct.structure_id)
-                    self.audit_log.log(
-                        action="STRUCTURE_SETTLED",
-                        venue="portfolio",
-                        order_id=struct.structure_id,
-                        status="REALISED",
-                        metadata={"realised_profit_inr": struct.realised_profit_inr}
-                    )
+                    should_settle = True
+                    reason = f"expiry reached ({struct.expiry_display})"
+
+            # Paper auto-settle path: settle N hours after booking time
+            if not should_settle and paper_settle_hours > 0 and struct.booked_at:
+                try:
+                    booked_dt = datetime.fromisoformat(struct.booked_at.replace("Z", "+00:00"))
+                    hours_open = (now_dt - booked_dt).total_seconds() / 3600.0
+                    if hours_open >= paper_settle_hours:
+                        should_settle = True
+                        reason = f"paper auto-settle after {hours_open:.1f}h (config: {paper_settle_hours}h)"
+                except Exception:
+                    pass
+
+            if should_settle:
+                logger.info(f"[POLLER SETTLEMENT] Settling {struct.structure_id}: {reason}")
+                self.portfolio.settle_entire_structure(struct.structure_id)
+                self.audit_log.log(
+                    action="STRUCTURE_SETTLED",
+                    venue="portfolio",
+                    order_id=struct.structure_id,
+                    status="REALISED",
+                    metadata={
+                        "realised_profit_inr": struct.realised_profit_inr,
+                        "reason": reason,
+                    }
+                )
 
     def execute_approved_candidate(self, item_id: str, approved_by: str = "operator", notes: str | None = None) -> tuple[bool, str]:
         """Executes a previously queued candidate upon operator approval."""

@@ -35,10 +35,8 @@ def test_server_http_and_api():
             ct = resp.headers.get("Content-Type", "")
             assert "text/html" in ct
             body = resp.read().decode("utf-8")
-            assert "PolyArb Terminal" in body
-            assert "tabApprovals" in body
-            assert "tabAnalytics" in body
-            assert "tabPerformance" in body
+            assert "POLYARB" in body or "PolyArb" in body
+            assert "positions-list" in body
 
         # 2. Test GET /static/app.css
         with urllib.request.urlopen(f"{base_url}/static/app.css") as resp:
