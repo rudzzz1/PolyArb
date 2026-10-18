@@ -10,6 +10,7 @@ test_files = [
     "tests/test_replay_and_legging.py",
     "tests/test_limits_and_controls.py",
     "tests/test_fixtures.py",
+    "tests/test_simulator.py",
 ]
 
 if __name__ == "__main__":

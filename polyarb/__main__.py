@@ -1,7 +1,7 @@
 import argparse, json, sys
 from pathlib import Path
 import sqlite3
-from . import gamma, kalshi, matcher, scanner, recorder, stream, doctor, replay as rp
+from . import gamma, kalshi, matcher, scanner, recorder, stream, doctor, replay as rp, server
 from .config import Config, trigger_kill_switch, is_kill_switch_active
 
 ap = argparse.ArgumentParser(prog="polyarb")
@@ -62,6 +62,10 @@ p.add_argument("--all-candidates", action="store_true")
 # 9. kill / unkill
 k = sub.add_parser("kill", help="emergency halt: trigger kill switch")
 k.add_argument("--reason", default="Manual operator kill switch trigger")
+# 10. ui
+uip = sub.add_parser("ui", help="start trading terminal web UI on localhost")
+uip.add_argument("--port", type=int, default=8085, help="local port (default: 8085)")
+
 sub.add_parser("unkill", help="remove kill switch and allow running")
 
 a = ap.parse_args()
@@ -181,6 +185,9 @@ elif a.cmd == "replay":
     )
     for k, v in rp.summarize(eps, hs).items():
         print(f"{k:>30}: {v}")
+
+elif a.cmd == "ui":
+    server.start_server(a.port)
 
 else:
     scanner.run(interval=a.interval, fee_bps=a.fee_bps, min_edge=a.min_edge,
